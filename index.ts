@@ -8,9 +8,20 @@
 
 import { Client, createAgent, type ClientChannel, type ConnectConfig, type SFTPWrapper, type Stats } from "ssh2";
 import { spawn } from "node:child_process";
-import { promises as fsPromises, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
+import {
+  accessSync,
+  chmodSync,
+  constants as fsConstants,
+  promises as fsPromises,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import {
   basename,
+  delimiter,
   dirname,
   isAbsolute as isLocalAbsolute,
   join,
@@ -74,9 +85,21 @@ interface CredentialCache {
   resume?: { command: string; cwd: string };
 }
 
-interface SecretCodec {
-  protect(secret: string): Promise<string>;
-  unprotect(ciphertext: string): Promise<string>;
+export interface SecretCodec {
+  /** Stable tag persisted next to the ciphertext, e.g. `dpapi` or `file`. */
+  readonly id: string;
+  /** Short human-readable backend name for UI messages. */
+  readonly label: string;
+  /** Whether this backend can be used in the current environment. */
+  readonly available: boolean;
+  /**
+   * Encrypt/hand the secret to the backend. `endpointId` is used both as AES-GCM
+   * associated data (file backend) and as the keychain account name.
+   */
+  protect(endpointId: string, secret: string): Promise<string>;
+  unprotect(endpointId: string, ciphertext: string): Promise<string>;
+  /** Best-effort removal of an out-of-file copy (OS keychains own the secret). */
+  remove?(endpointId: string): Promise<void> | void;
 }
 
 interface PersistentCredentialFile {
@@ -137,14 +160,9 @@ const cacheHost = globalThis as typeof globalThis & { [CACHE_KEY]?: CredentialCa
 const credentialCache = cacheHost[CACHE_KEY] ??= { passwords: new Map<string, string>() };
 const clientLastErrors = new WeakMap<Client, Error>();
 
-function runPowerShell(script: string, input: string): Promise<string> {
+function runCommand(command: string, args: string[], input?: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn("powershell.exe", [
-      "-NoLogo",
-      "-NoProfile",
-      "-NonInteractive",
-      "-Command", script,
-    ], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn(command, args, { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
     const stdout: Buffer[] = [];
     const stderr: Buffer[] = [];
     child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
@@ -153,9 +171,33 @@ function runPowerShell(script: string, input: string): Promise<string> {
     child.once("error", reject);
     child.once("close", (code) => {
       if (code === 0) resolve(Buffer.concat(stdout).toString("utf8").trim());
-      else reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `PowerShell exited with code ${code}`));
+      else reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `${command} exited with code ${code}`));
     });
-    child.stdin.end(input, "utf8");
+    child.stdin.end(input ?? "", "utf8");
+  });
+}
+
+function runPowerShell(script: string, input: string): Promise<string> {
+  return runCommand("powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], input);
+}
+
+/** Resolve a command on PATH without spawning a process (safe at import time). */
+function hasCommand(name: string): boolean {
+  const searchPath = process.env.PATH;
+  if (!searchPath) return false;
+  const extensions = process.platform === "win32"
+    ? (process.env.PATHEXT ?? ".EXE").split(";").filter(Boolean)
+    : [""];
+  return searchPath.split(delimiter).some((dir) => {
+    if (!dir) return false;
+    return extensions.some((extension) => {
+      try {
+        accessSync(join(dir, name + extension), fsConstants.X_OK);
+        return true;
+      } catch {
+        return false;
+      }
+    });
   });
 }
 
@@ -179,23 +221,185 @@ export const WINDOWS_DPAPI_UNPROTECT_SCRIPT = [
   "[Convert]::ToBase64String($plainBytes)",
 ].join(";");
 
+// ---- credential backends ----------------------------------------------------
+//
+// Each backend stores one endpoint password. Secrets live either inside
+// `ssh-remote-credentials.json` (self-contained ciphertext, tagged with the
+// backend id) or, for OS keystores, in the keychain itself with only a small
+// tag left in the file.
+
+const CREDENTIAL_TAG_SEPARATOR = ":";
+const WINDOWS_DPAPI_CODEC_ID = "dpapi";
+const MAC_KEYCHAIN_CODEC_ID = "keychain";
+const LIBSECRET_CODEC_ID = "libsecret";
+const FILE_CODEC_ID = "file";
+const OS_KEYSTORE_SERVICE = "pi-ssh-remote";
+const KEY_FILE_PATH = join(AGENT_DIR, "ssh-remote-secret.key");
+const AES_GCM_IV_BYTES = 12;
+const AES_GCM_TAG_BYTES = 16;
+const KEY_FILE_BYTES = 32;
+
 const windowsDpapiCodec: SecretCodec = {
-  async protect(secret) {
+  id: WINDOWS_DPAPI_CODEC_ID,
+  label: "Windows DPAPI",
+  available: process.platform === "win32",
+  async protect(_endpointId, secret) {
     return runPowerShell(WINDOWS_DPAPI_PROTECT_SCRIPT, Buffer.from(secret, "utf8").toString("base64"));
   },
-  async unprotect(ciphertext) {
+  async unprotect(_endpointId, ciphertext) {
     const encoded = await runPowerShell(WINDOWS_DPAPI_UNPROTECT_SCRIPT, ciphertext);
     return Buffer.from(encoded, "base64").toString("utf8");
   },
 };
 
+const macKeychainCodec: SecretCodec = {
+  id: MAC_KEYCHAIN_CODEC_ID,
+  label: "macOS Keychain",
+  available: process.platform === "darwin" && hasCommand("security"),
+  async protect(endpointId, secret) {
+    await runCommand("security", ["add-generic-password", "-U", "-s", OS_KEYSTORE_SERVICE, "-a", endpointId, "-w", secret]);
+    return "";
+  },
+  async unprotect(endpointId) {
+    const secret = await runCommand("security", ["find-generic-password", "-s", OS_KEYSTORE_SERVICE, "-a", endpointId, "-w"]);
+    if (!secret) throw new Error("macOS Keychain returned an empty secret");
+    return secret;
+  },
+  async remove(endpointId) {
+    await runCommand("security", ["delete-generic-password", "-s", OS_KEYSTORE_SERVICE, "-a", endpointId]);
+  },
+};
+
+const libsecretCodec: SecretCodec = {
+  id: LIBSECRET_CODEC_ID,
+  label: "libsecret / Secret Service",
+  available: process.platform !== "win32" && hasCommand("secret-tool"),
+  async protect(endpointId, secret) {
+    await runCommand(
+      "secret-tool",
+      ["store", "--label", `${OS_KEYSTORE_SERVICE} ${endpointId}`, "service", OS_KEYSTORE_SERVICE, "account", endpointId],
+      secret,
+    );
+    return "";
+  },
+  async unprotect(endpointId) {
+    const secret = await runCommand("secret-tool", ["lookup", "service", OS_KEYSTORE_SERVICE, "account", endpointId]);
+    if (!secret) throw new Error("secret-tool returned no stored secret (locked or missing keyring?)");
+    return secret;
+  },
+  async remove(endpointId) {
+    await runCommand("secret-tool", ["clear", "service", OS_KEYSTORE_SERVICE, "account", endpointId]);
+  },
+};
+
+/**
+ * Portable fallback backend: AES-256-GCM keyed by a random key kept in a 0600
+ * file next to the credential store. Passwords never appear in plaintext in
+ * `ssh-remote-credentials.json` (so backups, dotfile sync or a pasted config
+ * cannot leak them), but the key file sits in the same directory: this is
+ * weaker than an OS keystore and only protects the credential file itself.
+ */
+export function createFileKeyCodec(keyPath: string): SecretCodec {
+  let cachedKey: Buffer | undefined;
+
+  const readKey = (): Buffer => {
+    const key = Buffer.from(readFileSync(keyPath, "utf8").trim(), "hex");
+    if (key.length !== KEY_FILE_BYTES) throw new Error(`credential key file ${keyPath} is not a ${KEY_FILE_BYTES}-byte hex key`);
+    return key;
+  };
+
+  const loadKey = (): Buffer => {
+    if (cachedKey) return cachedKey;
+    try {
+      const existing = readKey();
+      try { chmodSync(keyPath, 0o600); } catch {}
+      cachedKey = existing;
+      return existing;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    mkdirSync(dirname(keyPath), { recursive: true });
+    const key = randomBytes(KEY_FILE_BYTES);
+    try {
+      writeFileSync(keyPath, `${key.toString("hex")}\n`, { mode: 0o600, flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      // Another Pi process created the key first: reuse it instead of forking the store.
+      cachedKey = readKey();
+      return cachedKey;
+    }
+    try { chmodSync(keyPath, 0o600); } catch {}
+    cachedKey = key;
+    return key;
+  };
+
+  return {
+    id: FILE_CODEC_ID,
+    label: "encrypted key file",
+    available: true,
+    async protect(endpointId, secret) {
+      const iv = randomBytes(AES_GCM_IV_BYTES);
+      const cipher = createCipheriv("aes-256-gcm", loadKey(), iv, { authTagLength: AES_GCM_TAG_BYTES });
+      cipher.setAAD(Buffer.from(endpointId, "utf8"));
+      const ciphertext = Buffer.concat([cipher.update(secret, "utf8"), cipher.final()]);
+      return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString("base64");
+    },
+    async unprotect(endpointId, payload) {
+      const raw = Buffer.from(payload, "base64");
+      if (raw.length <= AES_GCM_IV_BYTES + AES_GCM_TAG_BYTES) throw new Error("credential payload is truncated");
+      const decipher = createDecipheriv("aes-256-gcm", loadKey(), raw.subarray(0, AES_GCM_IV_BYTES), { authTagLength: AES_GCM_TAG_BYTES });
+      decipher.setAAD(Buffer.from(endpointId, "utf8"));
+      decipher.setAuthTag(raw.subarray(AES_GCM_IV_BYTES, AES_GCM_IV_BYTES + AES_GCM_TAG_BYTES));
+      return Buffer.concat([decipher.update(raw.subarray(AES_GCM_IV_BYTES + AES_GCM_TAG_BYTES)), decipher.final()]).toString("utf8");
+    },
+  };
+}
+
+const fileKeyCodec = createFileKeyCodec(KEY_FILE_PATH);
+
+/**
+ * Backends in preference order. OS keystores come first; the local encrypted
+ * key file is always last so persistence keeps working on headless Linux,
+ * containers and any platform without a usable keyring.
+ */
+export function resolveCredentialCodecs(): SecretCodec[] {
+  const codecs = [windowsDpapiCodec, macKeychainCodec, libsecretCodec].filter((codec) => codec.available);
+  codecs.push(fileKeyCodec);
+  return codecs;
+}
+
 export class PersistentCredentialStore {
   constructor(
     private readonly path: string,
-    private readonly codec?: SecretCodec,
+    private readonly codecs: SecretCodec[] = [],
   ) {}
 
-  get available(): boolean { return Boolean(this.codec); }
+  /** Labels of the backends usable in this environment, primary first. */
+  get backends(): string[] { return this.codecs.filter((codec) => codec.available).map((codec) => codec.label); }
+
+  /** Preferred backend label. */
+  get label(): string { return this.backends[0] ?? "no credential backend"; }
+
+  get available(): boolean { return Boolean(this.backends.length); }
+
+  private codecById(id: string): SecretCodec | undefined {
+    return this.codecs.find((codec) => codec.id === id);
+  }
+
+  /** Values written before backend tagging are Windows DPAPI ciphertext. */
+  private static split(raw: string): { codecId: string; payload: string } {
+    const index = raw.indexOf(CREDENTIAL_TAG_SEPARATOR);
+    if (index < 0) return { codecId: WINDOWS_DPAPI_CODEC_ID, payload: raw };
+    return { codecId: raw.slice(0, index), payload: raw.slice(index + 1) };
+  }
+
+  /** Backend label that owns this endpoint's stored secret, if it is readable now. */
+  backendFor(id: string): string | undefined {
+    const raw = this.load().passwords[id];
+    if (!raw) return undefined;
+    const codec = this.codecById(PersistentCredentialStore.split(raw).codecId);
+    return codec?.available ? codec.label : undefined;
+  }
 
   private load(): PersistentCredentialFile {
     try {
@@ -213,50 +417,75 @@ export class PersistentCredentialStore {
   }
 
   has(id: string): boolean {
-    return Boolean(this.codec && this.load().passwords[id]);
+    const raw = this.load().passwords[id];
+    if (!raw) return false;
+    return Boolean(this.codecById(PersistentCredentialStore.split(raw).codecId)?.available);
   }
 
   async get(id: string): Promise<string | undefined> {
-    if (!this.codec) return undefined;
-    const file = this.load();
-    const ciphertext = file.passwords[id];
-    if (!ciphertext) return undefined;
+    const raw = this.load().passwords[id];
+    if (!raw) return undefined;
+    const { codecId, payload } = PersistentCredentialStore.split(raw);
+    const codec = this.codecById(codecId);
+    if (!codec?.available) return undefined;
     try {
-      return await this.codec.unprotect(ciphertext);
+      return await codec.unprotect(id, payload);
     } catch {
       return undefined;
     }
   }
 
-  async set(id: string, password: string): Promise<boolean> {
-    if (!this.codec) return false;
-    const ciphertext = await this.codec.protect(password);
-    const file = this.load();
-    file.passwords[id] = ciphertext;
-    this.save(file);
-    return true;
+  /** Try each backend in order until one saves the secret. */
+  async set(id: string, password: string): Promise<{ persisted: boolean; backend?: string; error?: string }> {
+    const failures: string[] = [];
+    for (const codec of this.codecs) {
+      if (!codec.available) continue;
+      try {
+        const payload = await codec.protect(id, password);
+        const file = this.load();
+        file.passwords[id] = `${codec.id}${CREDENTIAL_TAG_SEPARATOR}${payload}`;
+        this.save(file);
+        return { persisted: true, backend: codec.label };
+      } catch (error) {
+        failures.push(`${codec.label}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return { persisted: false, error: failures.join("; ") || "no credential backend available" };
   }
 
   delete(id: string): boolean {
     const file = this.load();
-    if (!file.passwords[id]) return false;
+    const raw = file.passwords[id];
+    if (!raw) return false;
     delete file.passwords[id];
     this.save(file);
+    this.removeFromBackend(id, PersistentCredentialStore.split(raw).codecId);
     return true;
   }
 
   clear(): number {
     const file = this.load();
-    const count = Object.keys(file.passwords).length;
-    if (count) this.save({ version: 1, passwords: {} });
-    return count;
+    const ids = Object.keys(file.passwords);
+    if (!ids.length) return 0;
+    const tags = ids.map((id) => PersistentCredentialStore.split(file.passwords[id]!).codecId);
+    this.save({ version: 1, passwords: {} });
+    ids.forEach((id, index) => this.removeFromBackend(id, tags[index]!));
+    return ids.length;
+  }
+
+  /** Keychain-backed secrets live outside the JSON file; drop them best-effort. */
+  private removeFromBackend(id: string, codecId: string): void {
+    const codec = this.codecById(codecId);
+    if (!codec?.remove) return;
+    try {
+      void Promise.resolve(codec.remove(id)).catch(() => {});
+    } catch {
+      // Best effort only: the credential file no longer references the secret.
+    }
   }
 }
 
-const persistentCredentials = new PersistentCredentialStore(
-  CREDENTIALS_FILE,
-  process.platform === "win32" ? windowsDpapiCodec : undefined,
-);
+const persistentCredentials = new PersistentCredentialStore(CREDENTIALS_FILE, resolveCredentialCodecs());
 
 export function probeSshAgent(socketPath: string, timeoutMs = SSH_AGENT_PROBE_TIMEOUT_MS): Promise<boolean> {
   return new Promise((resolve) => {
@@ -433,10 +662,10 @@ async function getCachedPassword(config: ParsedSsh): Promise<string | undefined>
   return persistentPassword;
 }
 
-async function setCachedPassword(config: ParsedSsh, password: string): Promise<{ persisted: boolean; error?: string }> {
+async function setCachedPassword(config: ParsedSsh, password: string): Promise<{ persisted: boolean; backend?: string; error?: string }> {
   const id = cacheId(config);
   credentialCache.passwords.set(id, password);
-  try { return { persisted: await persistentCredentials.set(id, password) }; }
+  try { return await persistentCredentials.set(id, password); }
   catch (error) { return { persisted: false, error: error instanceof Error ? error.message : String(error) }; }
 }
 
@@ -1639,7 +1868,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   };
 
 
-  /** Retrieve the SSH login password through the existing memory/DPAPI credential path. */
+  /** Retrieve the SSH login password through the existing memory/credential-store path. */
   const requireSshPassword = async (state: RemoteState): Promise<string> => {
     const password = await getCachedPassword(state);
     if (password === undefined) {
@@ -1787,8 +2016,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       connections.set(endpointKey, next);
       if (passwordWasPrompted && password) {
         const persistence = await setCachedPassword(parsed, password);
-        if (persistentCredentials.available && !persistence.persisted) {
-          ctx.ui.notify(`SSH connected, but Windows could not save the password with DPAPI; it will remain available only in this Pi process. Error: ${persistence.error || "unknown DPAPI error"}`, "warning");
+        if (!persistence.persisted) {
+          ctx.ui.notify(`SSH connected, but the password could not be saved (${persistence.error || "no credential backend available"}); it stays in this Pi process only.`, "warning");
         }
       }
       if (shouldSelect) {
@@ -2038,7 +2267,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
 
   /**
    * Resolve the plaintext password for an endpoint from the in-memory cache
-   * first, then from the Windows DPAPI-encrypted credential store. Does not
+   * first, then from the persisted credential store (Windows DPAPI, macOS
+   * Keychain, libsecret, or the local encrypted key file). Does not
    * require the endpoint to be currently connected.
    */
   const getDecodedPassword = async (selector?: string): Promise<{ endpoint: string; password: string; source: "memory" | "persisted" }> => {
@@ -2051,7 +2281,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return { endpoint: endpointKey, password: saved, source: "persisted" };
     }
     throw new Error(
-      `No saved password for SSH endpoint ${endpointKey}. Connect to it at least once (ssh_remote_control connect / /remote ssh) so the password is saved with Windows DPAPI, then decode it again.`,
+      `No saved password for SSH endpoint ${endpointKey}. Connect to it at least once (ssh_remote_control connect / /remote ssh) so the password is saved with ${persistentCredentials.label}, then decode it again.`,
     );
   };
 
@@ -3081,11 +3311,11 @@ ${where}
   pi.registerTool({
     name: "ssh_remote_password",
     label: "SSH Remote Password (decode)",
-    description: "Decode the plaintext password for a configured SSH endpoint from the local DPAPI-encrypted credential store (in-memory cache first, then the persisted store). Use it when a remote step genuinely needs the password — e.g. elevating with sudo -S, configuring another service, or feeding a jump host — and the interactive prompt is not available to the agent.",
+    description: `Decode the plaintext password for a configured SSH endpoint from the local encrypted credential store (in-memory cache first, then the persisted backend: Windows DPAPI, macOS Keychain, libsecret, or the local AES-256-GCM key file). Backends available here: ${persistentCredentials.backends.join(", ")}. Use it when a remote step genuinely needs the password — e.g. elevating with sudo -S, configuring another service, or feeding a jump host — and the interactive prompt is not available to the agent.`,
     promptSnippet: "Decode a saved SSH endpoint password",
     promptGuidelines: [
       "DECODED PASSWORDS ARE PLAINTEXT and leak into the model context, transcripts, and tool logs. Call this only when the password is actually needed for the current task; do not echo it back unless the task requires it.",
-      "A password is only decodeable for an endpoint that was connected at least once with saving enabled (Windows DPAPI, CurrentUser scope, at ~/.pi/agent/ssh-remote-credentials.json).",
+      "A password is only decodeable for an endpoint that was connected at least once with saving enabled (persisted to ~/.pi/agent/ssh-remote-credentials.json through Windows DPAPI, macOS Keychain, libsecret, or the local AES-256-GCM key file ~/.pi/agent/ssh-remote-secret.key).",
       "Endpoint can be a full key, host/IP, user@host, host:port, or a unique prefix/note; it does not need to be currently connected.",
     ],
     parameters: Type.Object({
@@ -3093,7 +3323,7 @@ ${where}
     }),
     async execute(_id, params, _signal, _update, ctx) {
       if (!persistentCredentials.available) {
-        throw new Error("Credential decoding is only available on Windows via DPAPI; no credential codec is available in this environment");
+        throw new Error("No credential backend is available in this environment; saved passwords cannot be decoded");
       }
       const decoded = await getDecodedPassword(params.endpoint);
       return {
@@ -3135,7 +3365,7 @@ ${where}
         const pool = connectionSnapshot();
         const rows = pool.map((entry) => `${entry.selected ? "*" : " "} ${entry.endpoint}  cwd=${entry.cwd}${entry.note ? `  note=${entry.note}` : ""}${entry.passwordSaved ? "  password=saved" : ""}`);
         const text = `${connections.size} SSH connection(s); tool routing: ${remote && routeRemoteTools ? `remote via ${cacheId(remote)}` : "local"}${mappings.length ? `; forwarded local ports: ${mappings.join(", ")}` : ""}\n${rows.join("\n") || "No live SSH connections"}`;
-        return { content: [{ type: "text", text }], details: { connected: connections.size > 0, connectionCount: connections.size, connections: pool, selectedEndpoint: remote ? cacheId(remote) : undefined, cwd: remote?.cwd, toolRouting: remote && routeRemoteTools ? "remote" : "local", configPath: REMOTE_CONFIG_FILE, credentialsPath: CREDENTIALS_FILE, forwardedPorts: mappings } };
+        return { content: [{ type: "text", text }], details: { connected: connections.size > 0, connectionCount: connections.size, connections: pool, selectedEndpoint: remote ? cacheId(remote) : undefined, cwd: remote?.cwd, toolRouting: remote && routeRemoteTools ? "remote" : "local", configPath: REMOTE_CONFIG_FILE, credentialsPath: CREDENTIALS_FILE, credentialBackend: persistentCredentials.label, credentialBackends: persistentCredentials.backends, forwardedPorts: mappings } };
       }
       if (params.action === "disconnect" || params.action === "forget") {
         const forget = params.action === "forget";
@@ -3190,7 +3420,7 @@ ${where}
       }
       if (params.action === "password") {
         if (!persistentCredentials.available) {
-          throw new Error("Credential decoding is only available on Windows via DPAPI; no credential codec is available in this environment");
+          throw new Error("No credential backend is available in this environment; saved passwords cannot be decoded");
         }
         const decoded = await getDecodedPassword(params.endpoint);
         return {
@@ -3287,7 +3517,7 @@ ${where}
             : endpoint.passthroughMode === "sudo"
               ? `sudo root ${endpoint.sudoCwd || endpoint.remoteCwd || FALLBACK_REMOTE_CWD}`
               : "host";
-          return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    $ context: ${passthrough}\n    forward: ${endpoint.forwards?.join(", ") || "none"}\n    password: ${persistentCredentials.has(key) ? "saved with Windows DPAPI" : "not saved"}`;
+          return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    $ context: ${passthrough}\n    forward: ${endpoint.forwards?.join(", ") || "none"}\n    password: ${persistentCredentials.backendFor(key) ? `saved with ${persistentCredentials.backendFor(key)}` : "not saved"}`;
         });
         ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\nDisplay lines: ${configuredDisplayLines(config)}\n${rows.join("\n") || "No saved endpoints"}`, "info");
         return;
@@ -3456,7 +3686,7 @@ ${where}
       if (/^password(?:\s+|$)/i.test(input)) {
         const selector = input.replace(/^password\s*/i, "").trim() || undefined;
         try {
-          if (!persistentCredentials.available) throw new Error("Credential decoding is only available on Windows via DPAPI");
+          if (!persistentCredentials.available) throw new Error("No credential backend is available in this environment");
           const decoded = await getDecodedPassword(selector);
           ctx.ui.notify(`Decoded password for ${decoded.endpoint} (source: ${decoded.source}): ${decoded.password}`, "info");
         } catch (error) { ctx.ui.notify(`SSH remote password decode failed: ${(error as Error).message}`, "error"); }

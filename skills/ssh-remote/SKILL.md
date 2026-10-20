@@ -107,7 +107,8 @@ ssh_remote_control  action=disconnect   endpoint=<key>|all
 - `ssh_remote_transfer`:服务器 → 一个或多个服务器(经由本机中继,两端不需要互通)
   source + sourcePath + target/targets + targetPath;via=stream(默认,内存有界不占本地盘)
   或 stage(经本地临时文件,更快,但需本地磁盘≈文件大小)
-- `ssh_remote_password`:解码指定服务器的明文密码(Windows DPAPI 加密存储),
+- `ssh_remote_password`:解码指定服务器的明文密码(加密凭据库:Windows DPAPI / macOS Keychain /
+  Linux libsecret / 本地 AES-256-GCM 密钥文件,按平台自动选择),
   `endpoint=<选择器>`(无需已连接);或 `ssh_remote_control action=password`。
   仅当远端需要密码且无法交互输入时用(如 sudo -S、给其它服务配密),解出的明文会进入模型上下文。
 
@@ -158,7 +159,8 @@ recursive(默认 true);远端路径可用 `/...` 或 `~/...`,相对路径相对�
 - **记住用户只给片段时先查已配置端点,禁止全网搜 IP**(见"端点识别"章节)。
 - 连接/激活本身**不改变**内置工具的路由;只有 `route routing=remote` 才把
   read/write/bash 切到远程
-- 需要密码的端点,Windows 上用 DPAPI 加密持久化:首次输入后,后续会话自动连接
+- 需要密码的端点,密码加密持久化(Windows DPAPI、macOS Keychain、Linux libsecret,无可用密钥环时
+  回退到 AES-256-GCM 密钥文件):首次输入后,后续会话自动连接;`ssh_remote_password` 在 Linux/macOS 上同样可用
 - 远程命令默认 600 秒超时(`ssh-remote-config.json` 可用 `defaultTimeout` / 每端点 `timeout` 覆盖,
   单次调用也可传 `timeout` 参数);输出超大时会折叠,完整输出保存到临时文件
 - exec/batch 默认带 PTY:输出实时流式推给 CLI;执行中按 Esc 会向远端进程组发 SIGINT

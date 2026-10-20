@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.0
+
+- **凭据持久化不再只限 Windows**：密码后端改为可插拔的 `SecretCodec` 链，按平台自动选择，
+  并在首选后端不可用时自动回退到下一个可用后端。
+  - `win32`：Windows DPAPI（行为、密文格式、旧文件全部保持兼容）；
+  - `darwin`：macOS Keychain（`security`，可用时优先）；
+  - Linux/其它：`secret-tool`（libsecret / Secret Service，可用时优先）；
+  - 最后兜底：本地密钥文件加密（AES-256-GCM，密钥 `~/.pi/agent/ssh-remote-secret.key`，0600），
+    任何平台都可用，无头服务器、容器里也能持久化密码。
+- 凭据文件中的每条密码都带后端标签（`dpapi:` / `keychain:` / `libsecret:` / `file:`）；
+  无标签的历史值继续按 DPAPI 解析，升级无需迁移。
+- 密钥库类后端（Keychain / libsecret）只在 `ssh-remote-credentials.json` 里留一个标签，
+  明文密码存在系统密钥库中；`/remote forget` 与 `--all` 会同步清理密钥库里的副本。
+- `ssh_remote_password`、`ssh_remote_control action=password`、`/remote password`
+  在 Linux/macOS 上现在也可用；`/remote connections` 会显示每条凭据由哪个后端保存。
+- 保存失败时的告警改为通用文案（附带真实失败原因），不再假定 Windows/DPAPI。
+- 新增离线回归测试 `test/credentials.ts`：AES-GCM 往返与端点绑定（AAD）、密文篡改拒绝、
+  后端标签与回退、旧无标签 DPAPI 值、损坏密文降级为 `undefined`、密钥库副本清理。
+
 ## 0.5.1
 
 - `$ctx sudo` 与 Docker socket 权限回退统一复用当前 SSH 端点的已保存密码（内存/Windows DPAPI），不再单独询问 sudo 密码。

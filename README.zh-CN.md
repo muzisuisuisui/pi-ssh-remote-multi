@@ -305,11 +305,11 @@ Pi 会通过插件提供的 `ssh_remote_control` 工具完成这些操作。
 | `ssh_remote_put` | 把本机文件/目录上传到一个或多个服务器 |
 | `ssh_remote_get` | 把某个服务器的文件/目录下载到本机 |
 | `ssh_remote_transfer` | 在服务器之间拷贝文件/目录(经由本机中继) |
-| `ssh_remote_password` | 解码指定服务器的明文密码(Windows DPAPI) |
+| `ssh_remote_password` | 解码指定服务器的明文密码(来自加密凭据库) |
 
 ## 密码解码
 
-密码在 Windows 上以当前用户的 DPAPI 密文存在 `~/.pi/agent/ssh-remote-credentials.json`,
+密码以加密形式存在 `~/.pi/agent/ssh-remote-credentials.json`(或系统密钥库,见下节),
 agent 平时在幕后完成认证、看不到明文。当某些无法弹窗提示密码的步骤真的需要密码时
 (如远端 `sudo -S`、给其它服务配密码、跳板机),可用 `ssh_remote_password`
 (`endpoint=<选择器>`)、`ssh_remote_control action=password` 或 `/remote password [endpoint]`
@@ -366,15 +366,33 @@ ssh_remote_transfer source=110.3.241.21 sourcePath=/data/ckpt.tar \
 - 命令预览设置；
 - `$` 穿透目标服务器（`passthroughEndpoint`）；每个容器的 `$` 目录（`containerCwds`）、sudo 目录（`sudoCwd`）和上下文模式。
 
-密码不会写入上述配置文件。在 Windows 上，首次使用密码成功连接后，插件会显式加载 .NET `System.Security`，使用当前 Windows 用户范围的 `ProtectedData`（DPAPI）加密密码，并把密文保存到：
+密码不会写入上述配置文件。首次用密码连接成功后,插件会把密码交给当前平台首选的凭据后端加密保存:
+
+| 平台 | 首选后端 | 说明 |
+|---|---|---|
+| Windows | **DPAPI** | 通过 PowerShell 调用 .NET `ProtectedData`(CurrentUser 作用域),密文写在凭据文件里 |
+| macOS | **Keychain** | 通过 `security` 存取,凭据文件里只留标签 |
+| Linux | **libsecret** | 通过 `secret-tool`(GNOME Keyring / KWallet 等 Secret Service),需已解锁的会话密钥环 |
+| 任意平台兜底 | **本地密钥文件** | AES-256-GCM,密钥在 `~/.pi/agent/ssh-remote-secret.key`(权限 0600) |
+
+后端按上表顺序依次尝试:首选后端不可用或报错(如无头服务器没有密钥环、钥匙串被锁定)时
+自动回退到下一个,因此无头 Linux、容器里也能持久化密码。密文/标签保存在:
 
 ```text
 ~/.pi/agent/ssh-remote-credentials.json
 ```
 
-下次启动 Pi 时，插件会在内存中解密并用于连接，通常不再显示密码输入框。凭据只能由保存它的 Windows 用户解密；文件中没有明文密码。密码认证失败时，插件会删除该服务器的旧凭据并提示输入新密码；网络超时、服务器离线、远程目录错误等非认证故障不会删除密码。
+凭据文件为 0600,其中不含明文密码;每条记录带后端标签(`dpapi:` / `keychain:` / `libsecret:` / `file:`),
+无标签的历史记录继续按 DPAPI 解析,升级无需迁移。下次启动 Pi 时,插件会在内存中解密并用于连接,
+通常不再显示密码输入框。密码认证失败时,插件会删除该服务器的旧凭据并提示输入新密码;
+网络超时、服务器离线、远程目录错误等非认证故障不会删除密码。
 
-`/remote forget [ENDPOINT]` 可以主动删除一台服务器的凭据，`/remote forget --all` 可以删除全部凭据。非 Windows 系统目前仍只使用当前 Pi 进程的内存缓存。
+`/remote forget [ENDPOINT]` 可以主动删除一台服务器的凭据,`/remote forget --all` 可以删除全部凭据
+(Keychain / libsecret 里的副本也会一并清理)。
+
+密钥文件兜底只保证密码不以明文出现在凭据文件里(备份、dotfile 同步、贴配置都不会泄),
+它无法抵御能读取你 home 目录的本地攻击者。需要更强的隔离请用 OS 密钥库:桌面上装 `secret-tool`,
+Windows/macOS 则默认走 DPAPI / Keychain。
 
 ## 安全与输出限制
 

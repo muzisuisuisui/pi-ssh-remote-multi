@@ -13,8 +13,8 @@
 | **多连接池** | 同一会话内保持多台服务器同时在线，连接第二台不会断开第一台 |
 | **`ssh_remote_batch`** | 跨多台服务器并行跑命令，结果按输入顺序返回，单台失败不取消其他 |
 | **三向文件传输** | `ssh_remote_put`（本地→一台或多台）、`ssh_remote_get`（服务器→本地）、`ssh_remote_transfer`（服务器→一台或多台，经本地中继） |
-| **凭据持久化** | DPAPI 加密保存密码到 Windows 凭据存储（`ssh-remote-credentials.json`），重开 Pi 自动重连，不落明文 |
-| **`ssh_remote_password`** | 从内存缓存或 DPAPI 凭据库解码明文密码（用于远程 `sudo -S`、跳板机等非交互场景） |
+| **凭据持久化** | 密码加密保存到本地凭据库（Windows DPAPI / macOS Keychain / libsecret / 本地 AES-256-GCM 密钥文件，按平台自动选择），重开 Pi 自动重连，不落明文 |
+| **`ssh_remote_password`** | 从内存缓存或凭据库解码明文密码（用于远程 `sudo -S`、跳板机等非交互场景） |
 | **端点选择语义** | 精确匹配优先于前缀匹配，避免 `.21` 被 `.210` 干扰 |
 | **路由控制** | 连接/选择端点不自动改路由；内置工具默认本地，只有显式 `/remote on` 才整体路由到所选服务器 |
 | **端点状态** | 每个端点记住远程 cwd、note、端口转发配置；note 显示在配置、状态和 footer |
@@ -90,10 +90,10 @@ pi install npm:pi-ssh-remote-multi
 
 ```
 pi-ssh-remote-multi/
-├── index.ts          # 扩展主入口：连接池、工具注册、控制面、文件传输、凭据存储、$ 穿透
-├── package.json      # name=pi-ssh-remote-multi, v0.5.1, MIT
+├── index.ts          # 扩展主入口：连接池、工具注册、控制面、文件传输、凭据后端(DPAPI/Keychain/libsecret/本地加密)、$ 穿透
+├── package.json      # name=pi-ssh-remote-multi, v0.6.0, MIT
 ├── LICENSE           # MIT（保留原作者）
-├── CHANGELOG.md      # 迭代记录（0.2.0 → 0.5.0）
+├── CHANGELOG.md      # 迭代记录（0.2.0 → 0.6.0）
 ├── README.md         # 英文文档（Agent-first）
 ├── README.zh-CN.md   # 中文文档
 └── skills/ssh-remote/SKILL.md  # 配套 skill（随插件自动发现）
@@ -103,4 +103,4 @@ pi-ssh-remote-multi/
 
 - 上游仓库：`https://github.com/petrichor20211/pi-ssh-remote`（v0.1.4）
 - 原作者：Yutong Bian and contributors
-- 本扩展版本：0.5.x，持续基于上游演进
+- 本扩展版本：0.6.x，持续基于上游演进
