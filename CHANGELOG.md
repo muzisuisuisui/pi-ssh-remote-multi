@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.1
+
+- 修复并行首次连接时后续服务器卡死：pi 的交互层同一时刻只能显示一个扩展对话框，
+  第二个 `ctx.ui.custom` / `ctx.ui.confirm` 会把前一个组件换下却**不 resolve** 它的 promise，
+  于是第一个连接永远等不到密码输入。现在所有连接期的交互（密码、主机密钥确认、
+  `/control_ssh`、`$ctx`、`/remote ssh`）都经过同一个串行化队列 `withUiDialog()`，
+  一次只弹一个、依次回答，任何连接都不会再被丢弃的对话框挂住。
+- 密码提示现在明确标出服务器：`SSH password for root@110.3.241.21:22 (saved password rejected) — Enter submits, Esc skips:`；
+  多个连接同时等待时附带 `· N more waiting`，一眼看出这次输的是哪台机器。
+- 同一端点被多个并行工具调用请求时复用同一次连接尝试（`pendingConnects`），
+  不会再出现两次拨号、两次密码提示、两个 client 抢写 `connections` 的情况。
+- 首次并行连接时，谁先连上谁成为当前选中端点；不再由最后启动的那个覆盖选择。
+- 底部状态栏在拨号期间列出所有正在连接的端点（`SSH connecting a, b, +1…`），不再是最后一个覆盖前面。
+- 会话结束时会清空对话框队列和未完成的连接尝试，避免遗留 promise 把后续连接卡住。
+- 新增离线回归测试 `test/password-prompt.ts`：提示文案含端点/重试原因/排队数、对话框严格串行、
+  并发请求全部得到回答、某个对话框报错或永远不返回时队列仍可恢复。
+
 ## 0.6.0
 
 - **凭据持久化不再只限 Windows**：密码后端改为可插拔的 `SecretCodec` 链，按平台自动选择，

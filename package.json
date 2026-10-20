@@ -1,6 +1,6 @@
 {
   "name": "pi-ssh-remote-multi",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Persistent multi-server SSH workspaces for Pi.",
   "type": "module",
   "author": "Yutong Bian and contributors",
@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "npm run check && node --import tsx test/passthrough-input.ts && node --import tsx test/passthrough-hazard.ts && node --import tsx test/credentials.ts",
+    "test": "npm run check && node --import tsx test/passthrough-input.ts && node --import tsx test/passthrough-hazard.ts && node --import tsx test/credentials.ts && node --import tsx test/password-prompt.ts",
     "pack:check": "npm run check && npm pack --dry-run"
   },
   "files": [

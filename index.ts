@@ -1511,10 +1511,62 @@ class PasswordInput implements Component, Focusable {
   invalidate(): void {}
 }
 
-async function askPassword(ctx: any, prompt = "SSH password:"): Promise<string | null> {
-  if (ctx.mode !== "tui") return (await ctx.ui.input(prompt, "password")) ?? null;
-  return ctx.ui.custom((tui: any, _theme: any, _keys: any, done: (value: string | null) => void) =>
-    new PasswordInput(prompt, done, () => tui.requestRender()));
+/**
+ * pi's interactive host renders exactly one extension dialog at a time: a second
+ * `ctx.ui.custom`/`ctx.ui.confirm` swaps the component out of the editor area
+ * without resolving the earlier promise, so that caller waits forever. The agent
+ * routinely opens several endpoints in one turn, which used to leave every
+ * connection after the first hanging on a prompt that could never be answered.
+ * All connect-time prompts therefore queue here instead of racing for the slot.
+ */
+let uiDialogQueue: Promise<unknown> = Promise.resolve();
+let pendingUiDialogs = 0;
+
+/** Prompt slots currently executing or waiting (one per pending connect). */
+export function pendingUiDialogCount(): number {
+  return pendingUiDialogs;
+}
+
+/** Run one interactive dialog once every earlier dialog has been answered. */
+export function withUiDialog<T>(run: () => Promise<T>): Promise<T> {
+  pendingUiDialogs += 1;
+  // The counter is decremented inside the queue chain, before the next queued
+  // dialog starts, so a prompt never reports itself as still waiting.
+  const settled = uiDialogQueue.then(run, run).then(
+    (value) => { pendingUiDialogs -= 1; return value; },
+    (error) => { pendingUiDialogs -= 1; throw error; },
+  );
+  uiDialogQueue = settled.catch(() => {});
+  return settled;
+}
+
+/**
+ * Drop a queue that can never drain, e.g. a dialog pi closed without resolving
+ * while reloading the extension. Otherwise every later prompt would wait on it.
+ */
+export function resetUiDialogQueue(): void {
+  uiDialogQueue = Promise.resolve();
+  pendingUiDialogs = 0;
+}
+
+/**
+ * Prompt text for one SSH password. The endpoint label (`user@host:port`) is the
+ * first thing in the line so a burst of parallel connections still tells you
+ * which server each prompt belongs to.
+ */
+export function passwordPromptText(label: string, hint?: string, waiting = 0): string {
+  const detail = [hint, waiting > 0 ? `${waiting} more waiting` : undefined].filter(Boolean).join(" · ");
+  return `SSH password for ${label}${detail ? ` (${detail})` : ""} — Enter submits, Esc skips:`;
+}
+
+async function askPassword(ctx: any, label: string, hint?: string): Promise<string | null> {
+  return withUiDialog(async () => {
+    // Inside the queue this prompt already counts itself; the rest are behind it.
+    const prompt = passwordPromptText(label, hint, pendingUiDialogs - 1);
+    if (ctx.mode !== "tui") return (await ctx.ui.input(prompt, "password")) ?? null;
+    return ctx.ui.custom((tui: any, _theme: any, _keys: any, done: (value: string | null) => void) =>
+      new PasswordInput(prompt, done, () => tui.requestRender()));
+  });
 }
 
 /**
@@ -1728,10 +1780,17 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     status(ctx);
   };
 
+  /** Endpoints currently dialing: probing the host key, authenticating, or waiting for a password. */
+  const connectingLabels = new Set<string>();
+
   const status = (ctx: any) => {
     currentCtx = ctx;
     const count = connections.size;
-    if (!remote) {
+    const connecting = [...connectingLabels];
+    if (connecting.length) {
+      const shown = connecting.length > 3 ? `${connecting.slice(0, 3).join(", ")}, +${connecting.length - 3}` : connecting.join(", ");
+      ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("warning", `SSH connecting ${shown}…${count ? ` · ${count} connected` : ""}`));
+    } else if (!remote) {
       ctx.ui.setStatus("ssh-remote", count ? ctx.ui.theme.fg("accent", `SSH ${count} connected · tools local`) : undefined);
     } else if (routeRemoteTools) {
       ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `SSH ${count} connected · active ${endpointDisplayLabel(remote)}:${remote.cwd}`));
@@ -1953,6 +2012,14 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
   };
 
+  /**
+   * One dial-in-progress per endpoint, shared by every caller that asks for that
+   * endpoint while it is still connecting. Without it the agent opening the same
+   * host from several parallel tool calls would dial twice, prompt twice, and
+   * race two clients into `connections`.
+   */
+  const pendingConnects = new Map<string, Promise<RemoteState | null>>();
+
   const connectInteractive = async (command: string, ctx: any, cwd?: string, activate = false): Promise<RemoteState | null> => {
     let parsed: ParsedSsh;
     try { parsed = parseSshCommand(command); }
@@ -1962,52 +2029,77 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       return null;
     }
     lastConnectionError = undefined;
-
     const endpointKey = cacheId(parsed);
-    const shouldSelect = activate || !remote;
+
+    const inFlight = pendingConnects.get(endpointKey);
+    if (inFlight) {
+      const shared = await inFlight;
+      if (shared && activate && remote !== shared) {
+        remote = shared;
+        credentialCache.resume = { command: shared.command, cwd: shared.cwd };
+        lastCommand = shared.command;
+        saveEndpointConfig(shared.command, { remoteCwd: shared.cwd }, true);
+        status(ctx);
+      }
+      return shared;
+    }
+
+    const attempt = connectParsed(parsed, command, ctx, cwd, activate)
+      .finally(() => { if (pendingConnects.get(endpointKey) === attempt) pendingConnects.delete(endpointKey); });
+    pendingConnects.set(endpointKey, attempt);
+    return attempt;
+  };
+
+  const connectParsed = async (parsed: ParsedSsh, command: string, ctx: any, cwd?: string, activate = false): Promise<RemoteState | null> => {
+    const endpointKey = cacheId(parsed);
     const existing = connections.get(endpointKey);
     if (existing) {
-      if (shouldSelect) {
+      const select = activate || !remote;
+      if (select) {
         remote = existing;
         credentialCache.resume = { command: existing.command, cwd: existing.cwd };
         lastCommand = existing.command;
         saveEndpointConfig(existing.command, { remoteCwd: existing.cwd }, true);
       }
       status(ctx);
-      ctx.ui.notify(`SSH remote already connected: ${endpointDisplayLabel(existing)}:${existing.cwd}${shouldSelect ? " (selected)" : ""}`, "info");
+      ctx.ui.notify(`SSH remote already connected: ${endpointDisplayLabel(existing)}:${existing.cwd}${select ? " (selected)" : ""}`, "info");
       return existing;
     }
 
-    const key = `${parsed.host}:${parsed.port}`;
-    const savedFingerprint = loadKnownHosts()[key];
-    const fingerprint = await probeFingerprint(parsed);
-    if (!savedFingerprint) {
-      const trusted = await ctx.ui.confirm("Trust SSH host", `${parsed.label}\nHost key: ${displayFingerprint(fingerprint)}\nTrust and save this key?`);
-      if (!trusted) { lastConnectionError = "The host key was not trusted"; return null; }
-      saveKnownHost(key, fingerprint);
-    } else if (savedFingerprint !== fingerprint) {
-      const trusted = await ctx.ui.confirm(
-        "SSH host key changed",
-        `${parsed.label}\nPrevious key: ${displayFingerprint(savedFingerprint)}\nNew key: ${displayFingerprint(fingerprint)}\nVerify the server identity. Update the saved key and continue?`,
-      );
-      if (!trusted) { lastConnectionError = "The changed host key was rejected"; return null; }
-      saveKnownHost(key, fingerprint);
-    }
-
-    let password = await getCachedPassword(parsed);
-    let passwordWasPrompted = false;
-    ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("warning", `SSH remote connecting ${endpointDisplayLabel(parsed)}…`));
+    const label = endpointDisplayLabel(parsed);
+    connectingLabels.add(label);
+    status(ctx);
     try {
+      const key = `${parsed.host}:${parsed.port}`;
+      const savedFingerprint = loadKnownHosts()[key];
+      const fingerprint = await probeFingerprint(parsed);
+      // Host-key dialogs share the password prompt queue: two unverified hosts
+      // opened in one turn must not overwrite each other's dialog.
+      if (!savedFingerprint) {
+        const trusted = await withUiDialog(() => Promise.resolve(ctx.ui.confirm("Trust SSH host", `${parsed.label}\nHost key: ${displayFingerprint(fingerprint)}\nTrust and save this key?`)));
+        if (!trusted) { lastConnectionError = "The host key was not trusted"; return null; }
+        saveKnownHost(key, fingerprint);
+      } else if (savedFingerprint !== fingerprint) {
+        const trusted = await withUiDialog(() => Promise.resolve(ctx.ui.confirm(
+          "SSH host key changed",
+          `${parsed.label}\nPrevious key: ${displayFingerprint(savedFingerprint)}\nNew key: ${displayFingerprint(fingerprint)}\nVerify the server identity. Update the saved key and continue?`,
+        )));
+        if (!trusted) { lastConnectionError = "The changed host key was rejected"; return null; }
+        saveKnownHost(key, fingerprint);
+      }
+
+      let password = await getCachedPassword(parsed);
+      let passwordWasPrompted = false;
       let next: RemoteState;
       try {
         next = await establish(parsed, password, cwd ?? configuredCwd(command));
       } catch (error) {
         if (!isAuthenticationFailure(error)) throw error;
-        if (password) deleteCachedPassword(parsed);
-        password = await askPassword(ctx) ?? undefined;
+        const hadSavedPassword = password !== undefined;
+        if (hadSavedPassword) deleteCachedPassword(parsed);
+        password = await askPassword(ctx, label, hadSavedPassword ? "saved password rejected" : "no saved password") ?? undefined;
         if (!password) {
           lastConnectionError = "SSH authentication failed and no replacement password was provided";
-          status(ctx);
           return null;
         }
         passwordWasPrompted = true;
@@ -2020,6 +2112,10 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           ctx.ui.notify(`SSH connected, but the password could not be saved (${persistence.error || "no credential backend available"}); it stays in this Pi process only.`, "warning");
         }
       }
+      // Selection is decided once the dial is done: when several first-time
+      // connections run in parallel, the first one to finish becomes active
+      // instead of the last one started stealing the selection.
+      const shouldSelect = activate || !remote;
       if (shouldSelect) {
         remote = next;
         credentialCache.resume = { command, cwd: next.cwd };
@@ -2027,15 +2123,16 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       }
       lastConnectionError = undefined;
       saveEndpointConfig(command, { remoteCwd: next.cwd }, shouldSelect);
-      status(ctx);
       ctx.ui.notify(`SSH remote connected: ${endpointDisplayLabel(next)}:${next.cwd}${shouldSelect ? " (selected)" : ""}; built-in tools remain ${routeRemoteTools ? "remote-routed" : "local"}`, "info");
       return next;
     } catch (error) {
       if (isAuthenticationFailure(error)) deleteCachedPassword(parsed);
       lastConnectionError = (error as Error).message;
-      status(ctx);
       ctx.ui.notify(`SSH remote connection failed: ${lastConnectionError}`, "error");
       return null;
+    } finally {
+      connectingLabels.delete(label);
+      status(ctx);
     }
   };
 
@@ -2447,7 +2544,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         ...names.map((name) => `${state.passthroughMode === "container" && state.container === name ? "*" : " "} 容器 ${name} · ${
           state.container === name ? state.containerCwd || "/" : ""}`),
       ];
-      const choice = await ctx.ui.select(`$ 执行上下文 (${cacheId(state)})`, rows);
+      const choice = await withUiDialog<string | undefined>(() => ctx.ui.select(`$ 执行上下文 (${cacheId(state)})`, rows));
       if (choice === undefined) { ctx.ui.notify("未更改 $ 执行上下文", "info"); return; }
       const index = rows.indexOf(choice);
       if (index === 0) await announce("host");
@@ -2884,7 +2981,7 @@ ${where}
     const currentKey = "key" in resolved ? resolved.key : undefined;
     const rows = entries.map(([key, state]) =>
       `${key === currentKey ? "*" : " "} ${endpointDisplayLabel(state)}  ·  ${passthroughContextLabel(state)}`);
-    const choice = await ctx.ui.select("选择 $ 命令穿透的目标服务器（* 为当前目标）", rows);
+    const choice = await withUiDialog<string | undefined>(() => ctx.ui.select("选择 $ 命令穿透的目标服务器（* 为当前目标）", rows));
     if (choice === undefined) { ctx.ui.notify("未更改 $ 穿透目标", "info"); return; }
     const picked = entries[rows.indexOf(choice)]?.[0];
     if (!picked) return;
@@ -3701,7 +3798,7 @@ ${where}
         } catch (error) { ctx.ui.notify(`Failed to change SSH remote path: ${(error as Error).message}`, "error"); }
         return;
       }
-      const command = input || await ctx.ui.input("SSH command:", lastCommand);
+      const command = input || await withUiDialog<string | undefined>(() => ctx.ui.input("SSH command:", lastCommand));
       if (!command) return;
       await connectInteractive(command, ctx);
     },
@@ -3729,6 +3826,7 @@ ${where}
 
   pi.on("session_start", async (event, ctx) => {
     currentCtx = ctx;
+    resetUiDialogQueue();
     ensureMultiServerToolsActive();
     status(ctx);
     if (event.reason === "reload" && credentialCache.resume) {
@@ -3737,9 +3835,14 @@ ${where}
     }
   });
   pi.on("session_shutdown", (event) => {
+    // Any dialog still open dies with the session; never keep the queue waiting on it.
+    resetUiDialogQueue();
     const previous = [...connections.values()];
     connections.clear();
     reconnectPromises.clear();
+    // A connect parked on a discarded prompt must not block the endpoint forever.
+    pendingConnects.clear();
+    connectingLabels.clear();
     remote = null;
     routeRemoteTools = false;
     sudoPasswords.clear();
