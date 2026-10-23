@@ -127,6 +127,8 @@ const KNOWN_HOSTS_FILE = join(AGENT_DIR, "ssh-remote-known-hosts.json");
 const REMOTE_CONFIG_FILE = join(AGENT_DIR, "ssh-remote-config.json");
 const CREDENTIALS_FILE = join(AGENT_DIR, "ssh-remote-credentials.json");
 const FALLBACK_REMOTE_CWD = "~";
+/** Budget for the `cd`/`pwd` handshake after the SSH transport is ready. */
+const ESTABLISH_HANDSHAKE_TIMEOUT_SECONDS = 20;
 const DEFAULT_DISPLAY_LINES = 5;
 const DEFAULT_REMOTE_TIMEOUT_SECONDS = 600; // 10 min safety net; override per call or per config
 const SSH_AGENT_PROBE_TIMEOUT_MS = 2000;
@@ -1205,19 +1207,64 @@ function execRemote(
   });
 }
 
+/** Opening the SFTP subsystem must not wait forever on a half-dead connection. */
+const SFTP_OPEN_TIMEOUT_MS = 15_000;
+
 function getSftp(client: Client): Promise<SFTPWrapper> {
-  return new Promise((resolve, reject) => client.sftp((error, sftp) => error ? reject(error) : resolve(sftp)));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`Timed out opening the SFTP subsystem after ${SFTP_OPEN_TIMEOUT_MS / 1000}s`));
+    }, SFTP_OPEN_TIMEOUT_MS);
+    timer.unref?.();
+    client.sftp((error, sftp) => {
+      if (settled) { try { sftp?.end(); } catch {} return; }
+      settled = true;
+      clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(sftp);
+    });
+  });
 }
 
-async function withSftp<T>(client: Client, operation: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
+/**
+ * Run one SFTP operation and reject as soon as the channel dies.
+ *
+ * ssh2 reports a lost connection on the channel (`close`/`error`) but pending
+ * SFTP requests (stat/readdir/mkdir/fastPut) simply never call back, which used
+ * to leave `ssh_remote_put` hanging forever with no output and no error.
+ */
+export async function withSftp<T>(client: Client, operation: (sftp: SFTPWrapper) => Promise<T>): Promise<T> {
   const sftp = await getSftp(client);
-  try { return await operation(sftp); }
-  finally { sftp.end(); }
+  const died = new Promise<never>((_, reject) => {
+    sftp.once("close", () => reject(new Error("SFTP channel closed during the operation")));
+    sftp.once("error", (error: unknown) => reject(error instanceof Error ? error : new Error(String(error))));
+  });
+  // The race below normally settles first; keep a late channel death from
+  // surfacing as an unhandled rejection.
+  died.catch(() => {});
+  try {
+    return await Promise.race([operation(sftp), died]);
+  } finally {
+    try { sftp.end(); } catch { /* already gone */ }
+  }
 }
 
-function isReconnectable(error: unknown): boolean {
+/**
+ * Transport failures worth one automatic reconnect + retry. A dropped link
+ * surfaces either as a plain socket error or as ssh2's own SFTP wording
+ * ("Received unexpected SFTP session termination"); a stalled or aborted
+ * transfer must NOT be retried, it would just stall again.
+ */
+export function isReconnectable(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /channel open failure|open failed|not connected|no response|econnreset|econnrefused|etimedout|ehostunreach|epipe|connection (?:lost|closed)|socket.*closed|client is not connected/i.test(message);
+  // Only our own two outcomes are terminal: a stall would stall again, and a
+  // user abort must stay aborted. Node's "connection aborted" (ECONNABORTED) is
+  // a real transport drop and must still be retried.
+  if (/^transfer aborted$|stalled: no data moved/i.test(message)) return false;
+  return /channel open failure|open failed|not connected|no response|econnreset|econnrefused|etimedout|ehostunreach|epipe|connection (?:lost|closed|aborted)|sftp channel closed|channel closed|session termination|unable to start subsystem|socket.*closed|client is not connected/i.test(message);
 }
 
 function isAuthenticationFailure(error: unknown): boolean {
@@ -1289,13 +1336,20 @@ class TxProgress {
     const now = Date.now();
     if (!force && now - this.lastEmit < 250) return;
     this.lastEmit = now;
-    this.onUpdate({ content: [{ type: "text", text }], details: undefined });
+    // Progress is reported from inside ssh2's transfer loop: a throwing UI
+    // callback there would break the chunk pipeline and hang the transfer.
+    try { this.onUpdate({ content: [{ type: "text", text }], details: undefined }); }
+    catch { /* progress is cosmetic; never fail the transfer for it */ }
   }
   /** Per-file progress line, e.g. `[ssh_remote_put] upload u@h:22 data.bin 12% (1.3 GB / 10.5 GB)` */
   file(phase: TxPhase, rel: string, done: number, total: number, remoteLabel?: string): void {
     const percent = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
     const where = remoteLabel ? ` ${remoteLabel}` : "";
     this.emit(`[${this.tool}] ${phase}${where} ${rel} ${percent}% (${formatSize(done)} / ${formatSize(total)})`, false);
+  }
+  /** Directory-walk progress, so a slow scan never looks like a hung upload. */
+  scan(localPath: string, files: number, bytes: number): void {
+    this.emit(`[${this.tool}] scanning ${localPath} · ${files} file(s), ${formatSize(bytes)}`, false);
   }
   /** Distinct message, always emitted. */
   message(text: string): void {
@@ -1360,8 +1414,15 @@ async function collectRemoteFiles(sftp: SFTPWrapper, root: string): Promise<{ fi
   return { files, rootName: pathPosix.basename(root), isFile: false };
 }
 
-/** Walk a local directory tree, returning files with structure-preserving rel paths. */
-async function collectLocalFiles(localAbs: string): Promise<{ files: TransferFile[]; rootName: string; isFile: boolean }> {
+/**
+ * Walk a local directory tree, returning files with structure-preserving rel paths.
+ * `onScan` fires as entries are discovered so a huge tree still shows progress
+ * instead of looking like a hung upload.
+ */
+async function collectLocalFiles(
+  localAbs: string,
+  onScan?: (files: number, bytes: number) => void,
+): Promise<{ files: TransferFile[]; rootName: string; isFile: boolean }> {
   const rootStat = await fsPromises.stat(localAbs);
   if (!rootStat.isDirectory()) {
     return {
@@ -1371,6 +1432,7 @@ async function collectLocalFiles(localAbs: string): Promise<{ files: TransferFil
     };
   }
   const files: TransferFile[] = [];
+  let scannedBytes = 0;
   const walk = async (dir: string, relPrefix: string): Promise<void> => {
     const entries = await fsPromises.readdir(dir, { withFileTypes: true });
     for (const entry of entries) {
@@ -1380,7 +1442,11 @@ async function collectLocalFiles(localAbs: string): Promise<{ files: TransferFil
       else if (entry.isFile()) {
         const st = await fsPromises.stat(abs);
         files.push({ path: abs, rel, size: st.size, mtimeMs: st.mtimeMs });
+        scannedBytes += st.size;
       }
+    }
+    if (onScan) {
+      try { onScan(files.length, scannedBytes); } catch { /* cosmetic */ }
     }
   };
   await walk(localAbs, "");
@@ -1405,22 +1471,97 @@ function remoteDestFile(remoteDir: string, rel: string): string {
   return `${stripTrailingSlash(remoteDir)}/${rel}`;
 }
 
+/**
+ * ssh2's fastPut/fastGet can wait forever: when the peer disappears mid-file the
+ * final callback is never invoked (no progress, no error), which is exactly the
+ * "put hangs occasionally" report. Watch the progress counter, fail loudly after
+ * `stallTimeoutMs` without any byte moved, and free the channel so a retry gets
+ * a fresh connection.
+ */
+export const SFTP_STALL_TIMEOUT_MS = 120_000;
+const SFTP_STALL_CHECK_INTERVAL_MS = 5_000;
+
+export interface FastXferOptions {
+  concurrency: number;
+  chunkSize: number;
+  /** Defaults to the built-in stall timeout; tests pass a small value. */
+  stallTimeoutMs?: number;
+  /** Aborts the transfer as soon as it fires (pi cancels the tool call). */
+  signal?: AbortSignal;
+}
+
+export function sftpFastXfer(
+  direction: "upload" | "download",
+  sftp: SFTPWrapper,
+  srcPath: string,
+  dstPath: string,
+  size: number,
+  opts: FastXferOptions,
+  onStep: (done: number, total: number) => void,
+): Promise<void> {
+  const stallTimeoutMs = opts.stallTimeoutMs ?? SFTP_STALL_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let lastActivity = Date.now();
+    let onAbort: (() => void) | undefined;
+
+    const cleanup = () => {
+      clearInterval(watchdog);
+      if (opts.signal && onAbort) opts.signal.removeEventListener("abort", onAbort);
+    };
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (!error) { resolve(); return; }
+      // A wedged transfer keeps the channel (and its buffers) alive; drop it so
+      // the caller's retry/reconnect starts clean.
+      try { sftp.destroy(); } catch { /* already closed */ }
+      reject(error);
+    };
+
+    const watchdog = setInterval(() => {
+      const idleMs = Date.now() - lastActivity;
+      if (idleMs < stallTimeoutMs) return;
+      finish(new Error(
+        `${direction} stalled: no data moved for ${Math.max(1, Math.round(idleMs / 1000))}s (${formatSize(size)} total). `
+        + "The connection stopped responding; check the network/host and retry.",
+      ));
+    }, Math.min(SFTP_STALL_CHECK_INTERVAL_MS, stallTimeoutMs));
+    // Deliberately ref'd: while a transfer is pending the loop must stay alive
+    // long enough for the watchdog to fire, and cleanup() always clears it.
+
+    if (opts.signal?.aborted) return finish(new Error("Transfer aborted"));
+    if (opts.signal) {
+      onAbort = () => finish(new Error("Transfer aborted"));
+      opts.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    const step = (transferred: number) => {
+      lastActivity = Date.now();
+      try { onStep(transferred, size); } catch { /* progress is cosmetic */ }
+    };
+    const callback = (error?: Error | null) => finish(error ? (error instanceof Error ? error : new Error(String(error))) : undefined);
+    const options = { concurrency: opts.concurrency, chunkSize: opts.chunkSize, fileSize: size, step };
+
+    try {
+      if (direction === "upload") sftp.fastPut(srcPath, dstPath, options, callback);
+      else sftp.fastGet(srcPath, dstPath, options, callback);
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+
 function sftpFastPut(
   sftp: SFTPWrapper,
   localPath: string,
   remotePath: string,
   size: number,
-  opts: { concurrency: number; chunkSize: number },
+  opts: FastXferOptions,
   onStep: (done: number, total: number) => void,
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    sftp.fastPut(localPath, remotePath, {
-      concurrency: opts.concurrency,
-      chunkSize: opts.chunkSize,
-      fileSize: size,
-      step: (transferred) => onStep(transferred, size),
-    }, (error) => (error ? reject(error) : resolve()));
-  });
+  return sftpFastXfer("upload", sftp, localPath, remotePath, size, opts, onStep);
 }
 
 function sftpFastGet(
@@ -1428,17 +1569,10 @@ function sftpFastGet(
   remotePath: string,
   localPath: string,
   size: number,
-  opts: { concurrency: number; chunkSize: number },
+  opts: FastXferOptions,
   onStep: (done: number, total: number) => void,
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    sftp.fastGet(remotePath, localPath, {
-      concurrency: opts.concurrency,
-      chunkSize: opts.chunkSize,
-      fileSize: size,
-      step: (transferred) => onStep(transferred, size),
-    }, (error) => (error ? reject(error) : resolve()));
-  });
+  return sftpFastXfer("download", sftp, remotePath, localPath, size, opts, onStep);
 }
 
 /**
@@ -1451,11 +1585,15 @@ async function streamRelayFile(
   dstSftp: SFTPWrapper,
   dstPath: string,
   onData: (bytes: number) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
+  if (signal?.aborted) throw new Error("Transfer aborted");
   const readStream = srcSftp.createReadStream(srcPath, { highWaterMark: 1024 * 1024 });
   const writeStream = dstSftp.createWriteStream(dstPath, { highWaterMark: 1024 * 1024 });
-  readStream.on("data", (chunk: Buffer) => onData(chunk.length));
-  await pipeline(readStream, writeStream);
+  readStream.on("data", (chunk: Buffer) => {
+    try { onData(chunk.length); } catch { /* progress is cosmetic */ }
+  });
+  await pipeline(readStream, writeStream, signal ? { signal } : {});
 }
 
 /**
@@ -1470,7 +1608,7 @@ async function stageRelayFile(
   dstPath: string,
   size: number,
   tmpDir: string,
-  opts: { concurrency: number; chunkSize: number },
+  opts: FastXferOptions,
   onDownload: (done: number, total: number) => void,
   onUpload: (done: number, total: number) => void,
 ): Promise<void> {
@@ -1694,7 +1832,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     const client = await connect(parsed, password, fingerprint);
     try {
       const cdCommand = cwd === FALLBACK_REMOTE_CWD ? "cd -- ~" : `cd -- ${quote(cwd)}`;
-      const resolved = (await execRemote(client, `${cdCommand} && printf '%s\\n' "$HOME" && pwd -P`)).toString().trim().split("\n");
+      // A short budget: a host that cannot answer `cd` in time is not usable, and
+      // waiting the default 600s exec timeout looked like a hung connection.
+      const resolved = (await execRemote(client, `${cdCommand} && printf '%s\\n' "$HOME" && pwd -P`, false, ESTABLISH_HANDSHAKE_TIMEOUT_SECONDS)).toString().trim().split("\n");
       const home = resolved.shift()?.trim();
       const resolvedCwd = resolved.join("\n").trim();
       if (!home || !resolvedCwd) throw new Error("Unable to resolve remote HOME or working directory");
@@ -2178,7 +2318,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   ): Promise<TxStats> => {
     const stats: TxStats = { files: 0, bytes: 0, skipped: 0, startedAt: Date.now() };
     await withReconnectFor(cacheId(state), (client) => withSftp(client, async (sftp) => {
-      const collected = await collectLocalFiles(localAbs);
+      const collected = await collectLocalFiles(localAbs, (files, bytes) => progress.scan(localAbs, files, bytes));
       if (!opts.recursive && !collected.isFile) throw new Error("Source is a directory; set recursive=true to transfer it");
       const { remoteDir, exactDest } = await (async (): Promise<{ remoteDir: string; exactDest?: string }> => {
         if (!collected.isFile) return { remoteDir: stripTrailingSlash(remoteTarget) || "/" };
@@ -2188,16 +2328,24 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         return { remoteDir: posixDirname(remoteTarget), exactDest: remoteTarget };
       })();
       await sftpEnsureDir(sftp, remoteDir);
+      // Each file used to re-stat/re-create every parent directory; on a deep
+      // tree that turned into thousands of round trips that looked like a hang.
+      const ensuredDirs = new Set<string>([remoteDir]);
       for (const file of collected.files) {
         if (signal?.aborted) throw new Error("Transfer aborted");
         const dst = exactDest ?? remoteDestFile(remoteDir, file.rel);
-        const dstStat = await sftpStatSafe(sftp, dst);
+        // `always` overwrites regardless of the destination stat, so skip it.
+        const dstStat = opts.overwrite === "always" ? null : await sftpStatSafe(sftp, dst);
         if (!overwriteDecision(opts.overwrite, file.mtimeMs, dstStat)) {
           stats.skipped += 1;
           continue;
         }
-        await sftpEnsureDir(sftp, posixDirname(dst));
-        await sftpFastPut(sftp, file.path, dst, file.size, { concurrency: opts.concurrency, chunkSize: opts.chunkSize },
+        const parent = posixDirname(dst);
+        if (!ensuredDirs.has(parent)) {
+          await sftpEnsureDir(sftp, parent);
+          ensuredDirs.add(parent);
+        }
+        await sftpFastPut(sftp, file.path, dst, file.size, { concurrency: opts.concurrency, chunkSize: opts.chunkSize, signal },
           (done, total) => progress.file(TX_DIRECTION_PHASE.upload, file.rel, done, total, cacheId(state)));
         stats.files += 1;
         stats.bytes += file.size;
@@ -2243,7 +2391,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           continue;
         }
         await fsPromises.mkdir(dirname(dst), { recursive: true });
-        await sftpFastGet(sftp, file.path, dst, file.size, { concurrency: opts.concurrency, chunkSize: opts.chunkSize },
+        await sftpFastGet(sftp, file.path, dst, file.size, { concurrency: opts.concurrency, chunkSize: opts.chunkSize, signal },
           (done, total) => progress.file(TX_DIRECTION_PHASE.download, file.rel, done, total, cacheId(state)));
         stats.files += 1;
         stats.bytes += file.size;
@@ -2278,19 +2426,24 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
           return { remoteDir: posixDirname(dstTarget), exactDest: dstTarget };
         })();
         await sftpEnsureDir(dstSftp, remoteDir);
+        const ensuredDirs = new Set<string>([remoteDir]);
         for (const file of collected.files) {
           if (signal?.aborted) throw new Error("Transfer aborted");
           const dst = exactDest ?? remoteDestFile(remoteDir, file.rel);
-          const dstStat = await sftpStatSafe(dstSftp, dst);
+          const dstStat = opts.overwrite === "always" ? null : await sftpStatSafe(dstSftp, dst);
           if (!overwriteDecision(opts.overwrite, file.mtimeMs, dstStat)) {
             stats.skipped += 1;
             continue;
           }
-          await sftpEnsureDir(dstSftp, posixDirname(dst));
+          const parent = posixDirname(dst);
+          if (!ensuredDirs.has(parent)) {
+            await sftpEnsureDir(dstSftp, parent);
+            ensuredDirs.add(parent);
+          }
           if (opts.via === "stage") {
             await stageRelayFile(
               srcSftp, file.path, dstSftp, dst, file.size, tmpDir!,
-              { concurrency: opts.concurrency, chunkSize: opts.chunkSize },
+              { concurrency: opts.concurrency, chunkSize: opts.chunkSize, signal },
               (done, total) => progress.file(TX_DIRECTION_PHASE.download, file.rel, done, total, cacheId(srcState)),
               (done, total) => progress.file(TX_DIRECTION_PHASE.upload, file.rel, done, total, cacheId(dstState)),
             );
@@ -2299,7 +2452,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             await streamRelayFile(srcSftp, file.path, dstSftp, dst, (bytes) => {
               relayed += bytes;
               progress.file(TX_DIRECTION_PHASE.relay, file.rel, relayed, file.size, cacheId(dstState));
-            });
+            }, signal);
           }
           stats.files += 1;
           stats.bytes += file.size;

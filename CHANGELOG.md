@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.7.3
+
+- 修复 `ssh_remote_put`（以及 `get`/`transfer`）偶尔永久卡住：
+  - ssh2 的 `fastPut`/`fastGet` 在传输中途对端失联时可能**永不回调**，插件此前没有任何超时，
+    于是一直挂着。现在每个文件传输带**停滞看门狗**：120s 内没有任何字节推进就报错
+    `upload stalled: no data moved for 120s (…). The connection stopped responding…`，
+    并销毁该 SFTP 通道，让重试拿到干净连接（可通过 `stallTimeoutMs` 调整，测试用小值）。
+  - 打开 SFTP 子系统加 15s 超时；`withSftp()` 现在监听通道 `close`/`error`，
+    挂起的 `stat`/`readdir`/`mkdir` 不再无声等待（错误为 `SFTP channel closed during the operation`）。
+  - 通道中断被判定为可重连故障：`withReconnectFor` 会自动重连并重试一次，
+    掉线不再需要人工重发 put（覆盖 `Received unexpected SFTP session termination`、
+    `SFTP channel closed…`、`Unable to start subsystem: sftp`、`ECONNABORTED` 等传输层报错；
+    而停滞和用户取消不重试）。
+  - 传输中响应 `AbortSignal`（取消工具调用会立刻中断，server→server 中继同样生效）。
+  - 进度回调异常被吞掉：以前 `onUpdate` 抛错会从 ssh2 的 chunk 回调里冒出去，
+    直接打断传输循环并造成卡死。
+- 上传大目录时不再像卡死：本地遍历会持续输出 `scanning … N file(s), X`，
+  并且每个文件的父目录只 `mkdir -p` 一次（以前每个文件都重走一遍目录链），
+  `overwrite=always` 时跳过目标端 `stat`。
+- 连接握手（`cd`/`pwd`）改用 20s 预算，不再继承 exec 的 600s 默认超时，避免"连上了但一直没反应"。
+- 新增离线回归测试 `test/transfer-guard.ts`：正常完成、对端报错、停滞超时、慢速但有进度不误判、
+  取消信号、进度回调抛错、通道关闭时拒绝挂起操作。
+
 ## 0.7.2
 
 - 端点备注（note）不再出现在任何显示面：footer 标签、`ssh_remote_control` 的
