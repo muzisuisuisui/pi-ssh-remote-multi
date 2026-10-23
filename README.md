@@ -32,35 +32,6 @@
 | `ssh_remote_control` | 连接/激活/路由/重连/转发/断开等控制面 |
 | `ssh_remote_password` | 解码已保存端点的明文密码（仅必要时调用，注意敏感） |
 
-## `$` 穿透执行（人手工通道，v0.5.1）
-
-内置工具路由（`/remote on`）之外，多了一条**只给你自己**的通道：输入框里以 `$` 开头的内容
-直接送到「穿透目标服务器」执行，结果**完全不进模型上下文**（零 token 成本）。
-
-| 输入 | 作用 |
-|---|---|
-| `$ <command>` | 在穿透目标的当前执行上下文中执行，弹实时输出框，Esc/Ctrl+C 取消 |
-| `$cd <path>` | 修改当前执行上下文的目录；host 在宿主机解析，container 在容器内解析 |
-| `$ctx` | 选择执行上下文：宿主机普通用户、sudo root 或一个正在运行的 Docker 容器 |
-| `$ctx host` | 回到宿主机普通用户上下文 |
-| `$ctx sudo` | 切到宿主机 root 上下文；自动复用该 SSH 端点密码，密码只保存在当前进程内存 |
-| `$ctx docker <name>` | 选择 Docker 容器；之后的 `$` 命令都用 `docker exec` 在该容器内执行 |
-| `$ctx list` | 列出当前服务器目录和运行中的 Docker 容器 |
-| `$server [selector]` | 选择 `$` 的目标服务器（等同 `/control_ssh`；`$ctx <selector>` 仍兼容旧版服务器选择） |
-| `$force <command>` | 跳过交互命令预检；仅用于明确知道命令会自行退出的场景 |
-| `$` | 打印帮助与当前目标/上下文 |
-
-- 服务器目标与执行上下文显示在底部状态栏：`$→ <端点> · [docker <name>] <目录>`。
-- `/control_ssh` 保持一级菜单，只负责选择服务器；`$ctx` 负责选择该服务器上的 host/sudo/container 上下文。
-- 容器上下文只作用于 `$` 通道；内置工具、SFTP 文件读写和文件传输始终在宿主机，避免路径语义混淆。
-- 容器上下文使用非交互的 `docker exec -w <cwd> <container> <shell> -c <command>`；不需要手动输入 `docker exec -it ... bash`。
-- sudo 上下文使用 `sudo -S -u root -H bash -lc ...`，密码通过 SSH channel 的 stdin 一次性写入，不进入命令行或配置文件；sudo 目录与普通用户目录分开保存。
-- `$` 通道通常不转发远端 stdin。明显的 `su`、裸 `bash`、`docker exec -it ... bash`、`vim`、REPL 等会被提前提示，避免挂到超时；sudo 密码是插件专门的一次性 stdin 输入，不提供通用交互终端。
-- 每条 `$` 命令的记录以可折叠条目留在会话里（`Ctrl+O` 展开），但不发给模型。
-- 输出超 2000 行 / 50KB 自动截断并落临时文件，附完整输出路径。
-- `$` 后紧跟数字（如 `$100`）以及带附件的消息按普通聊天放行。
-- **`!`/`!!` 不再被接管**：它们始终在本机执行。
-
 ## 用户命令
 
 ```
@@ -71,7 +42,6 @@
 /remote connections          查看全部连接
 /remote status               状态总览
 /remote forget [--all]       删除保存的凭据
-/control_ssh                   选择 $ 穿透目标服务器（单级菜单，列出在线端点及各自目录）
 ```
 
 ## 安装
@@ -91,7 +61,7 @@ pi install npm:pi-ssh-remote-multi
 
 ```
 pi-ssh-remote-multi/
-├── index.ts          # 扩展主入口：连接池、工具注册、控制面、文件传输、凭据后端(DPAPI/Keychain/libsecret/本地加密)、$ 穿透
+├── index.ts          # 扩展主入口：连接池、工具注册、控制面、文件传输、凭据后端(DPAPI/Keychain/libsecret/本地加密)
 ├── package.json      # name=pi-ssh-remote-multi, v0.6.0, MIT
 ├── LICENSE           # MIT（保留原作者）
 ├── CHANGELOG.md      # 迭代记录（0.2.0 → 0.6.0）

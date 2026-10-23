@@ -134,26 +134,6 @@ recursive(默认 true);远端路径可用 `/...` 或 `~/...`,相对路径相对�
 2. `ssh_remote_batch` 在两台上执行同步命令(hostname / df / nproc / nvidia-smi)
 3. 随时 `status` 确认连接池与活动端点
 
-## 用户的 `$` 穿透通道(不是工具,你不要调用)
-
-从 0.4.0 起,插件把“人手工敲远端命令”的入口从 Pi 的 `!` 换成了 `$`。0.5.0 起,当前服务器上的 `$` 还可以选择 host、sudo root 或运行中的 Docker container 执行上下文:
-
-- 用户在输入框敲 `$ <command>` → 直接送到 `/control_ssh` 选定的穿透目标服务器,在底部显示的 host/sudo/container 上下文执行;结果不进模型上下文。
-- `$cd <path>` 在当前上下文解析并持久化;`$ctx` 打开 host/sudo/container 菜单,`$ctx host` 回普通用户,`$ctx sudo` 切宿主机 root（自动复用该 SSH 端点的已保存密码）,`$ctx docker <name>` 进容器。
-- `/control_ssh` 只负责选服务器;`$server` 是其文本别名;`$ctx <selector>` 仍兼容旧版的服务器选择写法。
-- 容器上下文只作用于 `$`:插件使用非交互 `docker exec -w <cwd> <container> <shell> -c <command>`;内置 `read/write/edit/bash`、SFTP 和传输工具始终在宿主机。
-- sudo 上下文只作用于 `$`:插件使用 `sudo -S -u root -H bash -lc ...`,密码仅在当前进程内存中缓存，不进入配置或命令行；sudo cwd 与普通 host cwd 分开。
-- **它返回 `handled`,所以既不会触发 LLM 请求,输出也不在你的上下文里**;命令与输出只以可折叠条目(`ssh-passthrough`)留在会话记录中。
-- Pi 原生 `!` / `!!` **不再被本插件接管**,始终在本机执行 —— 不要告诉用户 `!` 会跑到远端。
-- `$` 不提供通用远端 stdin 转发。明显的 `su`、裸 `bash`、`docker exec -it ... bash`、编辑器和 REPL 会被预检提示;`$force` 仅跳过预检,不等于获得交互终端。sudo 密码是插件专门的一次性 stdin 输入。
-- 需要并行打多台服务器时,`$` 一次只能命中一台,应当改用 `ssh_remote_batch`。
-
-对你的影响:
-- 需要用户 `$` 跑过的同一结果时,**自己用 `ssh_remote_exec` 在对应端点重跑**,或请用户粘贴;不要假装看得到 `$` 的输出。
-- 用户说“把穿透目标换成 X”时,提示他 `/control_ssh <selector>` 或 `$server <selector>`;除非用户明确要求,不要替他改这个人工通道。
-- 用户说“进入某个容器”时,提示使用 `$ctx docker <name>`;不要让用户在 `$` 中执行 `docker exec -it ... bash`。
-- 用户说“获取 sudo 权限/切 root”时,提示使用 `$ctx sudo`;不要让用户在 `$` 中执行 `sudo su - root`。
-
 ## 注意事项
 
 - **记住用户只给片段时先查已配置端点,禁止全网搜 IP**(见"端点识别"章节)。

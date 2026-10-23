@@ -66,18 +66,6 @@ interface RemoteState extends ParsedSsh {
   client: Client;
   cwd: string;
   home: string;
-  /** `$` context only; never affects built-in tool/SFTP cwd semantics. */
-  passthroughMode: "host" | "container" | "sudo";
-  /** Container name/id when passthroughMode is "container". */
-  container?: string;
-  /** Directory inside the container. `cwd` above always stays the *host* directory. */
-  containerCwd?: string;
-  /** Directory used by the sudo-root `$` context; host cwd remains independent. */
-  sudoCwd?: string;
-  /** Whether Docker commands on this host must be run through sudo. */
-  dockerSudo?: boolean;
-  /** Container names discovered on this host during the current connection. */
-  containers?: string[];
 }
 
 interface CredentialCache {
@@ -110,15 +98,6 @@ interface PersistentCredentialFile {
 interface RemoteEndpointConfig {
   sshCommand?: string;
   remoteCwd?: string;
-  /** Where `$` commands execute on this endpoint: on the host, or inside a container.
-   *  Built-in tools, SFTP file ops and transfers always stay on the host. */
-  passthroughMode?: "host" | "container" | "sudo";
-  /** Container name/id, required when passthroughMode is "container". */
-  passthroughContainer?: string;
-  /** Last directory used per container (the host directory lives in remoteCwd). */
-  containerCwds?: Record<string, string>;
-  /** Last directory used by the sudo-root `$` context. */
-  sudoCwd?: string;
   forwards?: string[];
   note?: string;
   /** Default remote exec timeout in seconds for this endpoint (overrides the global default). */
@@ -131,8 +110,6 @@ interface RemoteConfig {
   displayLines?: number;
   /** Default remote exec timeout in seconds when a tool call does not specify one. */
   defaultTimeout?: number;
-  /** Endpoint key that receives `$` passthrough commands (independent of tool routing). */
-  passthroughEndpoint?: string;
   /** Legacy fields migrated into endpoints on the next config write. */
   sshCommand?: string;
   remoteCwd?: string;
@@ -531,77 +508,6 @@ function shellWords(input: string): string[] {
   return words;
 }
 
-/** Always grabs the terminal or waits for input, no matter what arguments it has. */
-const ALWAYS_INTERACTIVE = new Set([
-  "su", "login", "vim", "vi", "nvim", "nano", "pico", "emacs",
-  "top", "htop", "less", "more", "man", "tmux", "screen",
-]);
-/** Only blocks when invoked with no script argument. */
-const BARE_INTERACTIVE = new Set([
-  "bash", "sh", "zsh", "ksh", "dash", "fish", "pwsh",
-  "python", "python3", "ipython", "node", "irb",
-  "mysql", "psql", "sqlplus", "redis-cli", "mongo",
-]);
-/** `-c`, `-lc`, `-mc`, `--command`: the program runs a script and exits. */
-const SCRIPT_FLAG = /^--command$|^-[a-z]*c$/;
-const SSH_OPTIONS_WITH_VALUE = new Set([
-  "-B", "-b", "-c", "-D", "-E", "-F", "-I", "-i", "-J", "-L", "-l", "-m",
-  "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w", "--bind-interface", "--config",
-  "--identity-file", "--jump", "--login", "--option", "--port", "--proxy-command",
-]);
-
-/** True when ssh has a host but no command to execute on that host. */
-const sshHasNoRemoteCommand = (words: string[]): boolean => {
-  let positional = 0;
-  for (let index = 1; index < words.length; index += 1) {
-    const word = words[index]!;
-    if (word === "--") return words.length - index - 1 <= 1;
-    if (word.startsWith("-") && word !== "-") {
-      if (SSH_OPTIONS_WITH_VALUE.has(word)) index += 1;
-      continue;
-    }
-    positional += 1;
-  }
-  return positional <= 1;
-};
-
-/**
- * The `$` channel is one-way: output streams back, but nothing is ever written
- * to the remote stdin. A command that waits for its next input therefore hangs
- * until the timeout. Reject the obvious cases up front; `$force` skips this check.
- */
-export function interactiveHazard(command: string): string | undefined {
-  for (const segment of command.split(/&&|;|\|\|/)) {
-    let words: string[];
-    try { words = shellWords(segment.trim()); }
-    catch { continue; }                          // unparseable -> let it run
-    while (words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!)) words.shift();
-    if (words[0] === "sudo" || words[0] === "doas") words.shift();
-    const flags = words.filter((word) => word.startsWith("-"));
-    const args = words.filter((word) => !word.startsWith("-"));
-    const program = (args[0] ?? "").split("/").pop() ?? "";
-    if (!program) continue;
-    const scripted = flags.some((flag) => SCRIPT_FLAG.test(flag));
-
-    if (program === "docker" && args[1] === "exec") {
-      // Without -i/-it docker exec never reads stdin, so it cannot hang there.
-      const keepsStdin = flags.some((flag) => flag === "--interactive" || /^-[a-z]*i[a-z]*$/.test(flag));
-      if (!keepsStdin) continue;
-      if (args.length <= 3) return "docker exec 后没有命令，会停在交互 shell";
-      const nested = (args[3] ?? "").split("/").pop() ?? "";
-      if (ALWAYS_INTERACTIVE.has(nested)) return `docker exec 进入 ${nested}，会接管终端`;
-      if (BARE_INTERACTIVE.has(nested) && !scripted && args.length <= 4) return `docker exec 进入交互式 ${nested}`;
-      continue;
-    }
-    if (program === "ssh" && (sshHasNoRemoteCommand(words) || flags.some((flag) => flag === "-t" || flag === "-tt"))) {
-      return "ssh 不带远端命令会进入交互会话";
-    }
-    if (ALWAYS_INTERACTIVE.has(program)) return `${program} 需要交互输入或会接管终端`;
-    if (BARE_INTERACTIVE.has(program) && args.length === 1 && !scripted) return `${program} 会等待交互输入`;
-  }
-  return undefined;
-}
-
 function parseSshCommand(command: string): ParsedSsh {
   const args = shellWords(command);
   if (args[0] !== "ssh") throw new Error("Command must start with ssh, for example: ssh root@host -p 22");
@@ -706,16 +612,6 @@ function quote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-/** Docker may be installed but the SSH user may not have access to its Unix socket. */
-function isDockerSocketPermissionError(value: string): boolean {
-  return /permission denied.*(?:docker daemon socket|docker\.sock)|(?:docker daemon socket|docker\.sock).*permission denied/i.test(value);
-}
-
-/** Run a command as root without putting the password in the command line. */
-function sudoShellCommand(command: string): string {
-  return `sudo -S -p '' -u root -H bash -lc ${quote(command)}`;
-}
-
 function parseDisplayLines(value: unknown): number {
   const lines = typeof value === "number" ? value : Number(value);
   if (!Number.isInteger(lines) || lines < 1 || lines > DEFAULT_MAX_LINES) {
@@ -760,12 +656,14 @@ function commandFromEndpointKey(key: string): string | undefined {
 function normalizeRemoteConfig(config: RemoteConfig): RemoteConfig {
   const endpoints = { ...(config.endpoints ?? {}) };
   for (const [key, endpoint] of Object.entries(endpoints)) {
+    // Whitelist known fields so legacy `$`-passthrough keys disappear on the next save.
     endpoints[key] = {
-      ...endpoint,
-      ...(endpoint.sshCommand ? {} : { sshCommand: commandFromEndpointKey(key) }),
+      ...(endpoint.sshCommand || commandFromEndpointKey(key) ? { sshCommand: endpoint.sshCommand || commandFromEndpointKey(key) } : {}),
+      ...(endpoint.remoteCwd !== undefined ? { remoteCwd: endpoint.remoteCwd } : {}),
+      ...(endpoint.forwards !== undefined ? { forwards: endpoint.forwards } : {}),
+      ...(endpoint.note !== undefined ? { note: endpoint.note } : {}),
+      ...(endpoint.timeout !== undefined ? { timeout: endpoint.timeout } : {}),
     };
-    // A container context without a name is meaningless; fall back to the host.
-    if (endpoint.passthroughMode === "container" && !endpoint.passthroughContainer?.trim()) endpoints[key].passthroughMode = "host";
   }
 
   let activeEndpoint = config.activeEndpoint;
@@ -789,17 +687,12 @@ function normalizeRemoteConfig(config: RemoteConfig): RemoteConfig {
   let defaultTimeout: number | undefined;
   try { defaultTimeout = config.defaultTimeout === undefined ? undefined : parseRemoteTimeout(config.defaultTimeout); }
   catch { defaultTimeout = undefined; }
-  // The `$` passthrough target must name a known endpoint; otherwise it is dropped.
-  const passthroughEndpoint = config.passthroughEndpoint && endpoints[config.passthroughEndpoint]
-    ? config.passthroughEndpoint
-    : undefined;
 
   return {
     ...(activeEndpoint ? { activeEndpoint } : {}),
     ...(Object.keys(endpoints).length ? { endpoints } : {}),
     ...(displayLines !== undefined ? { displayLines } : {}),
     ...(defaultTimeout !== undefined ? { defaultTimeout } : {}),
-    ...(passthroughEndpoint ? { passthroughEndpoint } : {}),
   };
 }
 
@@ -1569,119 +1462,6 @@ async function askPassword(ctx: any, label: string, hint?: string): Promise<stri
   });
 }
 
-/**
- * keyHint() throws when the host process has not initialized the theme, and a
- * render-time exception on this path would tear down the SSH channel mid-command.
- * Degrade to a literal instead of losing output for a cosmetic label.
- */
-function safeKeyHint(keybinding: Parameters<typeof keyHint>[0], description: string, fallback: string): string {
-  try { return keyHint(keybinding, description); }
-  catch { return fallback; }
-}
-
-/** Lines shown while collapsed, matching pi's own `!` bash box. */
-const PASSTHROUGH_PREVIEW_LINES = 20;
-/** Bound the in-memory buffer of a very chatty remote command. */
-const PASSTHROUGH_MAX_LINES = 2000;
-
-type PassthroughStatus = "running" | "complete" | "error" | "cancelled" | "timeout";
-
-/** Durable, non-LLM transcript record of one `$` invocation. */
-interface PassthroughRecord {
-  command: string;
-  endpoint: string;
-  label: string;
-  cwd: string;
-  status: Exclude<PassthroughStatus, "running">;
-  exitCode: number | null;
-  /** Already sanitized + tail-truncated text, with a full-output path when needed. */
-  text: string;
-  truncated: boolean;
-  totalLines: number;
-  fullOutputPath?: string;
-  elapsedMs: number;
-  exitLine: string;
-}
-
-/**
- * Live `$` execution box. Mirrors pi's `!` bash component (bordered box,
- * streaming tail, Esc to cancel) but its result never reaches the model.
- */
-class PassthroughRunComponent implements Component, Focusable {
-  focused = true;
-  private lines: string[] = [];
-  private partial = "";
-  private droppedLines = 0;
-  private state: PassthroughStatus = "running";
-  private exitLine = "";
-
-  constructor(
-    private readonly header: string,
-    private readonly theme: any,
-    private readonly onCancel: () => void,
-    private readonly renderNow: () => void,
-  ) {}
-
-  get running(): boolean { return this.state === "running"; }
-
-  append(chunk: Buffer): void {
-    // PTY output can split an ANSI escape across chunks; sanitize the joined
-    // buffer and keep the trailing fragment so it can be completed next time.
-    const joined = this.partial + chunk.toString("utf8");
-    const clean = sanitizePtyOutput(joined);
-    const rows = clean.split("\n");
-    this.partial = rows.pop() ?? "";
-    if (rows.length) {
-      this.lines.push(...rows);
-      if (this.lines.length > PASSTHROUGH_MAX_LINES) {
-        this.droppedLines += this.lines.length - PASSTHROUGH_MAX_LINES;
-        this.lines = this.lines.slice(-PASSTHROUGH_MAX_LINES);
-      }
-    }
-    this.renderNow();
-  }
-
-  /** Collect an exec result (or a transport failure) and paint the final state. */
-  settle(result: ExecRemoteResult | undefined, failure: string | undefined, cancelled: boolean, elapsedMs: number): void {
-    if (this.partial) { this.lines.push(this.partial); this.partial = ""; }
-    if (cancelled || result?.aborted) this.state = "cancelled";
-    else if (result?.timedOut) this.state = "timeout";
-    else if (failure) this.state = "error";
-    else this.state = result?.exitCode === 0 ? "complete" : "error";
-    if (failure) this.lines.push(`Error: ${failure}`);
-    const seconds = (elapsedMs / 1000).toFixed(1);
-    this.exitLine = this.state === "cancelled" ? `cancelled after ${seconds}s`
-      : this.state === "timeout" ? `timed out after ${seconds}s`
-      : `${this.state === "complete" ? "done" : "exit"} ${result?.exitCode ?? "?"} in ${seconds}s`;
-    this.renderNow();
-  }
-
-  handleInput(data: string): void {
-    // The hint advertises pi's tui.select.cancel binding, which is escape/ctrl+c;
-    // honour both so the label is never a lie.
-    if (this.running && (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c")))) this.onCancel();
-  }
-
-  render(width: number): string[] {
-    const edge = "─".repeat(Math.max(0, width - 2));
-    const shown = this.lines.slice(-PASSTHROUGH_PREVIEW_LINES);
-    const hidden = this.lines.length - shown.length + this.droppedLines;
-    const prompt = this.theme.fg("bashMode", this.theme.bold(`$ ${this.header}`));
-    const rows: string[] = ["", `┌${edge}┐`, ` ${prompt}`];
-    if (hidden > 0) rows.push(` ${this.theme.fg("muted", `… ${hidden} earlier line(s)`)}`);
-    for (const line of shown) rows.push(` ${this.theme.fg("toolOutput", line || " ")}`);
-    if (this.partial) rows.push(` ${this.theme.fg("toolOutput", this.partial)}`);
-    const hint = this.running
-      ? this.theme.fg("muted", `running… ${safeKeyHint("tui.select.cancel", "to cancel", "Esc to cancel")}`)
-      : this.theme.fg(this.state === "complete" ? "success" : "warning", this.exitLine);
-    rows.push(` ${hint}`);
-    rows.push(`└${edge}┘`);
-    return rows.map((row) => truncateToWidth(row, width, ""));
-  }
-
-  invalidate(): void {}
-}
-
 export default function sshRemoteExtension(pi: ExtensionAPI) {
   const localCwd = process.cwd();
   let remote: RemoteState | null = null;
@@ -1689,13 +1469,9 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
   let currentCtx: any;
   const connections = new Map<string, RemoteState>();
   const reconnectPromises = new Map<string, Promise<RemoteState>>();
-  /** Sudo passwords are session-only; never persist them in ssh-remote-config.json. */
-  const sudoPasswords = new Map<string, string>();
   const forwardServers = new Map<number, Server>();
   let lastConnectionError: string | undefined;
   let lastCommand = credentialCache.resume?.command ?? activeSshCommand() ?? "";
-  /** Endpoint that `$` passthrough commands target; independent of tool routing. */
-  let passthroughKey: string | undefined = loadRemoteConfig().passthroughEndpoint;
   const REMOTE_ABSOLUTE_MARKER = "__pi_ssh_remote_absolute__";
   const REMOTE_HOME_MARKER = "__pi_ssh_remote_home__";
 
@@ -1749,37 +1525,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return matches[0]!;
   };
 
-  /**
-   * Which endpoint a `$` command should run on. Priority: explicitly chosen
-   * target -> selected endpoint -> the only connected endpoint.
-   */
-  const resolvePassthrough = (): { key: string; state: RemoteState } | { error: string } => {
-    const configured = passthroughKey ?? loadRemoteConfig().passthroughEndpoint;
-    if (configured) {
-      const state = connections.get(configured);
-      // Keep the configured target across a drop: reconnect restores it.
-      if (state) return { key: configured, state };
-      return { error: `穿透目标 ${configured} 当前未连接。先重连（/remote connect 或 ssh_remote_control reconnect），或用 /control_ssh 换一台` };
-    }
-    if (remote && connections.has(cacheId(remote))) {
-      const key = cacheId(remote);
-      return { key, state: connections.get(key)! };
-    }
-    if (connections.size === 1) {
-      const [key, state] = [...connections.entries()][0]!;
-      return { key, state };
-    }
-    if (connections.size === 0) return { error: "没有已连接的 SSH 端点。先用 /remote ssh USER@HOST 或 ssh_remote_control connect 连接一台服务器" };
-    return { error: `${connections.size} 台服务器在线，但未指定 $ 穿透目标。用 /control_ssh 选择一台` };
-  };
-
-  const setPassthroughTarget = (key: string, ctx: any): void => {
-    passthroughKey = key;
-    const config = loadRemoteConfig();
-    if (config.passthroughEndpoint !== key) saveRemoteConfig({ ...config, passthroughEndpoint: key });
-    status(ctx);
-  };
-
   /** Endpoints currently dialing: probing the host key, authenticating, or waiting for a password. */
   const connectingLabels = new Set<string>();
 
@@ -1797,14 +1542,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     } else {
       ctx.ui.setStatus("ssh-remote", ctx.ui.theme.fg("accent", `SSH ${count} connected · selected ${endpointDisplayLabel(remote)} · tools local${forwardServers.size ? ` · tunnels ${[...forwardServers.keys()].join(",")}` : ""}`));
     }
-    // Show the `$` passthrough target and its live directory in the footer dash bar.
-    const resolved = resolvePassthrough();
-    if (!count) ctx.ui.setStatus("ssh-passthrough", undefined);
-    else if ("state" in resolved) {
-      ctx.ui.setStatus("ssh-passthrough", ctx.ui.theme.fg("accent", `$→ ${endpointDisplayLabel(resolved.state)} · ${passthroughContextLabel(resolved.state)}`));
-    } else {
-      ctx.ui.setStatus("ssh-passthrough", ctx.ui.theme.fg("muted", "$→ 未选择 (/control_ssh)"));
-    }
   };
 
   const connectionSnapshot = () => {
@@ -1812,7 +1549,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return [...connections.entries()].map(([endpoint, state]) => ({
       endpoint,
       cwd: state.cwd,
-      passthroughContext: passthroughContextLabel(state),
       note: config.endpoints?.[endpoint]?.note,
       selected: Boolean(remote && cacheId(remote) === endpoint),
       passwordSaved: persistentCredentials.has(endpoint),
@@ -1852,16 +1588,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       const home = resolved.shift()?.trim();
       const resolvedCwd = resolved.join("\n").trim();
       if (!home || !resolvedCwd) throw new Error("Unable to resolve remote HOME or working directory");
-      const saved = loadRemoteConfig().endpoints?.[cacheId(parsed)] ?? {};
-      const container = saved.passthroughMode === "container" ? saved.passthroughContainer?.trim() : undefined;
-      const passthroughMode: RemoteState["passthroughMode"] = saved.passthroughMode === "sudo"
-        ? "sudo"
-        : container ? "container" : "host";
-      const state: RemoteState = {
-        ...parsed, client, cwd: resolvedCwd, home, passthroughMode,
-        ...(container ? { container, containerCwd: saved.containerCwds?.[container] } : {}),
-        ...(passthroughMode === "sudo" ? { sudoCwd: saved.sudoCwd ?? resolvedCwd } : {}),
-      };
+      const state: RemoteState = { ...parsed, client, cwd: resolvedCwd, home };
       attachClient(state);
       return state;
     } catch (error) {
@@ -1924,57 +1651,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       const reconnected = await reconnectEndpoint(endpointKey);
       return operation(reconnected.client);
     }
-  };
-
-
-  /** Retrieve the SSH login password through the existing memory/credential-store path. */
-  const requireSshPassword = async (state: RemoteState): Promise<string> => {
-    const password = await getCachedPassword(state);
-    if (password === undefined) {
-      throw new Error(
-        `端点 ${cacheId(state)} 没有可用的已保存 SSH 密码；无法自动使用 sudo 访问 Docker。请先用密码方式连接并保存凭据，或将用户加入 docker 组。`,
-      );
-    }
-    return password;
-  };
-
-  /** Execute a Docker command normally, retrying once via sudo on socket permission errors. */
-  const execDockerRemote = async (
-    state: RemoteState,
-    command: string,
-    allowFailure = false,
-    timeoutSeconds = 60,
-  ): Promise<Buffer> => {
-    const endpointKey = cacheId(state);
-    const execute = (asRoot: boolean, password?: string): Promise<ExecRemoteResult> =>
-      withReconnectFor(endpointKey, (client) => execRemoteDetailed(
-        client,
-        asRoot ? sudoShellCommand(command) : command,
-        timeoutSeconds,
-        { pty: true, stdin: asRoot && password !== undefined ? `${password}\n` : undefined },
-      ));
-
-    let asRoot = Boolean(state.dockerSudo);
-    let password: string | undefined;
-    if (asRoot) password = await requireSshPassword(state);
-    let result = await execute(asRoot, password);
-    let combined = `${result.output.toString("utf8")}\n${result.stderr.toString("utf8")}`;
-    if (!asRoot && isDockerSocketPermissionError(combined)) {
-      password = await requireSshPassword(state);
-      result = await execute(true, password);
-      asRoot = true;
-      state.dockerSudo = true;
-      const live = connections.get(endpointKey);
-      if (live) live.dockerSudo = true;
-      combined = `${result.output.toString("utf8")}\n${result.stderr.toString("utf8")}`;
-    }
-    if (result.aborted) throw new Error("aborted");
-    if (result.timedOut) throw new Error(`Remote command timed out after ${result.timeoutSeconds} seconds`);
-    if (!allowFailure && result.exitCode !== 0) {
-      const tail = combined.replace(/\s+$/, "").split("\n").slice(-15).join("\n");
-      throw new Error(tail || `Remote command exited with code ${result.exitCode}`);
-    }
-    return result.output;
   };
 
   const withReconnect = async <T>(operation: (client: Client) => Promise<T>): Promise<T> => {
@@ -2208,7 +1884,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       credentialCache.resume = undefined;
       void stopForwards();
     }
-    sudoPasswords.delete(endpointKey);
     previous.client.end();
     status(ctx);
     return endpointKey;
@@ -2221,7 +1896,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     remote = null;
     routeRemoteTools = false;
     credentialCache.resume = undefined;
-    sudoPasswords.clear();
     void stopForwards();
     for (const state of states) {
       if (forgetPasswords) deleteCachedPassword(state);
@@ -2526,469 +2200,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return stats;
   };
 
-  // ---- $ passthrough execution ----------------------------------------------
-
-  /** Drive the `$` execution context: pick host vs container, by menu or by argument. */
-  const switchPassthroughContext = async (state: RemoteState, requested: string, ctx: any): Promise<void> => {
-    const text = requested.trim();
-    const announce = async (mode: RemoteState["passthroughMode"], name?: string) => {
-      const label = await setPassthroughContext(state, mode, ctx, name);
-      ctx.ui.notify(`$ 执行上下文 → ${label}`, "info");
-    };
-
-    if (!text) {
-      const names = await listContainers(state).catch(() => [] as string[]);
-      const rows = [
-        `${state.passthroughMode === "host" ? "*" : " "} 宿主机 · ${state.cwd}`,
-        `${state.passthroughMode === "sudo" ? "*" : " "} sudo(root) · ${state.cwd}`,
-        ...names.map((name) => `${state.passthroughMode === "container" && state.container === name ? "*" : " "} 容器 ${name} · ${
-          state.container === name ? state.containerCwd || "/" : ""}`),
-      ];
-      const choice = await withUiDialog<string | undefined>(() => ctx.ui.select(`$ 执行上下文 (${cacheId(state)})`, rows));
-      if (choice === undefined) { ctx.ui.notify("未更改 $ 执行上下文", "info"); return; }
-      const index = rows.indexOf(choice);
-      if (index === 0) await announce("host");
-      else if (index === 1) await announce("sudo");
-      else await announce("container", names[index - 2]);
-      return;
-    }
-
-    if (/^(?:host|user)$/i.test(text) || text === "宿主机") { await announce("host"); return; }
-    if (/^(?:sudo|root)$/i.test(text)) { await announce("sudo"); return; }
-    const dockerMatch = text.match(/^(?:docker|ctr|container)\s+(\S+)$/i);
-    if (dockerMatch) { await announce("container", dockerMatch[1]); return; }
-    if (text === "list" || text === "ls") {
-      const names = await listContainers(state).catch(() => [] as string[]);
-      ctx.ui.notify([
-        `宿主机: ${state.cwd}`,
-        names.length ? `容器: ${names.join(", ")}` : "容器: 无",
-        `当前: ${passthroughContextLabel(state)}`,
-      ].join("\n"), "info");
-      return;
-    }
-    const names = await listContainers(state).catch(() => [] as string[]);
-    if (names.includes(text)) { await announce("container", text); return; }
-    // 0.4.0 compatibility: `$ctx <selector>` used to mean "pick the target server".
-    try {
-      const key = resolveEndpointKey(text, true);
-      setPassthroughTarget(key, ctx);
-      const picked = connections.get(key)!;
-      ctx.ui.notify(`$ 穿透目标 → ${endpointDisplayLabel(picked)}:${passthroughContextLabel(picked)}`, "info");
-    } catch {
-      throw new Error(`既不是容器名也不是已连接端点: ${text}${names.length ? `；可选容器: ${names.slice(0, 12).join(", ")}` : ""}`);
-    }
-  };
-
-
-  /** Cache of per-container capability probes, keyed by endpoint + container. */
-  const dockerCaps = new Map<string, { workdir: boolean; shell: "bash" | "sh" }>();
-  const capsKey = (state: RemoteState): string => `${cacheId(state)}\u0000${state.container ?? ""}`;
-
-  /** Shell fragment for a path that may begin with `~`, expanded remotely and injection-safely. */
-  const shellPath = (target: string): string => {
-    const trimmed = target.trim();
-    if (trimmed === "~") return '"$HOME"';
-    if (trimmed.startsWith("~/")) return `"$HOME"${quote(trimmed.slice(1))}`;
-    return quote(trimmed);
-  };
-
-  /** Probe `docker exec -w` support and the best shell once per container. */
-  const probeDockerCaps = async (state: RemoteState): Promise<{ workdir: boolean; shell: "bash" | "sh" }> => {
-    const container = state.container;
-    if (!container) throw new Error("容器上下文缺少容器名");
-    const key = capsKey(state);
-    const cached = dockerCaps.get(key);
-    if (cached) return cached;
-    const workdir = await execDockerRemote(
-      state, `docker exec -w /tmp ${quote(container)} sh -c 'pwd -P' 2>/dev/null | tail -n 1`, true, 60,
-    ).then((buffer) => buffer.toString().trim() === "/tmp").catch(() => false);
-    const shell = await execDockerRemote(
-      state, `docker exec ${quote(container)} sh -c 'command -v bash >/dev/null 2>&1 && echo bash || echo sh'`, true, 60,
-    ).then((buffer): "bash" | "sh" => (buffer.toString().trim() === "bash" ? "bash" : "sh")).catch((): "bash" | "sh" => "sh");
-    const caps = { workdir, shell };
-    dockerCaps.set(key, caps);
-    return caps;
-  };
-
-  /**
-   * Wrap a command for the endpoint's `$` context. Host mode keeps the historical
-   * `cd` prefix; container mode uses `docker exec -w` when supported and falls
-   * back to a `cd` guard inside the container shell otherwise.
-   */
-  const buildPassthroughCommand = async (state: RemoteState, command: string): Promise<string> => {
-    if (state.passthroughMode === "sudo") {
-      const rootCommand = `cd -- ${quote(state.sudoCwd || state.cwd)} && ${command}`;
-      return `sudo -S -p '' -u root -H bash -lc ${quote(rootCommand)}`;
-    }
-    if (state.passthroughMode !== "container" || !state.container) return `cd -- ${quote(state.cwd)} && ${command}`;
-    const caps = await probeDockerCaps(state);
-    const shellExec = `${caps.shell} -c`;
-    if (caps.workdir && state.containerCwd) {
-      return `docker exec -w ${quote(state.containerCwd)} ${quote(state.container)} ${shellExec} ${quote(command)}`;
-    }
-    const guard = state.containerCwd ? `cd -- ${quote(state.containerCwd)} 2>/dev/null || cd -- /; ` : "";
-    return `docker exec ${quote(state.container)} ${shellExec} ${quote(`${guard}${command}`)}`;
-  };
-
-  /** Where `$` lands right now, for the footer, help text and transcript records. */
-  const passthroughContextLabel = (state: RemoteState): string =>
-    state.passthroughMode === "container" && state.container
-      ? `[docker ${state.container}] ${state.containerCwd || "/"}`
-      : state.passthroughMode === "sudo"
-        ? `[sudo root] ${state.sudoCwd || state.cwd}`
-        : state.cwd;
-
-  /** Keep a context mutation visible if an operation had to replace the connection state. */
-  const applyPassthroughState = (
-    state: RemoteState,
-    mode: RemoteState["passthroughMode"],
-    container: string | undefined,
-    containerCwd: string | undefined,
-    sudoCwd?: string,
-  ): void => {
-    const live = connections.get(cacheId(state));
-    for (const candidate of [state, live]) {
-      if (!candidate) continue;
-      candidate.passthroughMode = mode;
-      candidate.container = container;
-      candidate.containerCwd = containerCwd;
-      candidate.sudoCwd = sudoCwd;
-    }
-  };
-
-  /** Running Docker container names on this host, cached per connection. */
-  const listContainers = async (state: RemoteState): Promise<string[]> => {
-    if (state.containers) return state.containers;
-    const output = await execDockerRemote(
-      state,
-      `if ! command -v docker >/dev/null 2>&1; then echo 'docker is not installed' >&2; exit 127; fi; `
-      + `docker ps --format '{{.Names}}'`,
-      false,
-      60,
-    );
-    state.containers = output.toString().split("\n").map((line) => line.trim()).filter(Boolean);
-    return state.containers;
-  };
-
-  /** `$cd` inside a container: validate the directory *in the container* and persist it. */
-  const changeContainerCwd = async (state: RemoteState, requested: string, ctx: any): Promise<string> => {
-    if (!state.container) throw new Error("当前不是有效的容器上下文");
-    const container = state.container;
-    const caps = await probeDockerCaps(state);
-    const inner = `cd -- ${shellPath(requested)} && pwd -P`;
-    const base = state.containerCwd ? `cd -- ${quote(state.containerCwd)} 2>/dev/null || cd -- /; ` : "";
-    const script = caps.workdir && state.containerCwd
-      ? `docker exec -w ${quote(state.containerCwd)} ${quote(container)} ${caps.shell} -c ${quote(inner)}`
-      : `docker exec ${quote(container)} ${caps.shell} -c ${quote(`${base}${inner}`)}`;
-    const resolved = (await execDockerRemote(state, script, false, 60))
-      .toString().trim().split("\n").filter(Boolean).pop();
-    if (!resolved || !resolved.startsWith("/")) throw new Error(`容器内无法进入该目录: ${requested}`);
-    applyPassthroughState(state, "container", container, resolved);
-    const saved = loadRemoteConfig().endpoints?.[cacheId(state)] ?? {};
-    saveEndpointConfig(state.command, {
-      containerCwds: { ...(saved.containerCwds ?? {}), [container]: resolved },
-    });
-    status(ctx);
-    return resolved;
-  };
-
-  /** Resolve a directory with root privileges in the sudo `$` context. */
-  const changeSudoCwd = async (state: RemoteState, requested: string, ctx: any): Promise<string> => {
-    const password = await ensureSudoAccess(state, ctx);
-    const rootCommand = `cd -- ${shellPath(requested)} && pwd -P`;
-    const result = await withReconnectFor(cacheId(state), (client) => execRemoteDetailed(
-      client,
-      `sudo -S -p '' -u root -H bash -lc ${quote(rootCommand)}`,
-      60,
-      { pty: true, stdin: password === undefined ? undefined : `${password}\n` },
-    ));
-    if (result.timedOut) throw new Error("sudo 下切换目录超时");
-    if (result.aborted) throw new Error("sudo 下切换目录已取消");
-    if (result.exitCode !== 0) throw new Error(`sudo 下无法进入目录: ${requested}`);
-    const resolved = sanitizePtyOutput(result.output.toString("utf8")).trim().split("\n").filter(Boolean).pop();
-    if (!resolved || !resolved.startsWith("/")) throw new Error(`sudo 下无法解析目录: ${requested}`);
-    applyPassthroughState(state, "sudo", undefined, undefined, resolved);
-    saveEndpointConfig(state.command, { sudoCwd: resolved });
-    status(ctx);
-    return resolved;
-  };
-
-  /** Check whether this endpoint can run root without a sudo password. */
-  const hasPasswordlessSudo = async (state: RemoteState): Promise<boolean> => {
-    const result = await withReconnectFor(cacheId(state), (client) => execRemoteDetailed(
-      client,
-      "sudo -n -u root true",
-      30,
-      { pty: true },
-    ));
-    return result.exitCode === 0 && !result.timedOut && !result.aborted;
-  };
-
-  /** Obtain and verify a sudo password without ever putting it in a command line or config file. */
-  const ensureSudoAccess = async (state: RemoteState, ctx: any): Promise<string | undefined> => {
-    const endpointKey = cacheId(state);
-    const cached = sudoPasswords.get(endpointKey);
-    if (cached !== undefined) return cached;
-    if (await hasPasswordlessSudo(state)) return undefined;
-
-    const password = await requireSshPassword(state);
-    const verified = await withReconnectFor(endpointKey, (client) => execRemoteDetailed(
-      client,
-      "sudo -S -p '' -u root -H true",
-      30,
-      { pty: true, stdin: `${password}\n` },
-    ));
-    if (verified.timedOut) throw new Error("sudo 密码验证超时");
-    if (verified.aborted) throw new Error("sudo 密码验证已取消");
-    if (verified.exitCode !== 0) throw new Error("sudo 密码错误或当前用户无权提权");
-    sudoPasswords.set(endpointKey, password);
-    return password;
-  };
-
-  /** Switch (and persist) the endpoint's `$` context; re-resolves the directory for it. */
-  const setPassthroughContext = async (
-    state: RemoteState,
-    mode: RemoteState["passthroughMode"],
-    ctx: any,
-    container?: string,
-  ): Promise<string> => {
-    if (mode === "host") {
-      applyPassthroughState(state, "host", undefined, undefined);
-      saveEndpointConfig(state.command, { passthroughMode: "host", passthroughContainer: undefined });
-      status(ctx);
-      return passthroughContextLabel(state);
-    }
-
-    if (mode === "sudo") {
-      await ensureSudoAccess(state, ctx);
-      const sudoCwd = loadRemoteConfig().endpoints?.[cacheId(state)]?.sudoCwd || state.sudoCwd || state.cwd;
-      applyPassthroughState(state, "sudo", undefined, undefined, sudoCwd);
-      saveEndpointConfig(state.command, { passthroughMode: "sudo", passthroughContainer: undefined, sudoCwd });
-      status(ctx);
-      return passthroughContextLabel(state);
-    }
-
-    const name = container?.trim();
-    if (!name) throw new Error("需要容器名，例如 $ctx docker QWEN-9B");
-    const names = await listContainers(state);
-    if (!names.includes(name)) {
-      throw new Error(`容器 ${name} 未在运行中的 Docker 容器里找到。可选: ${names.slice(0, 12).join(", ") || "无"}${names.length > 12 ? " …" : ""}`);
-    }
-
-    const previous = {
-      mode: state.passthroughMode,
-      container: state.container,
-      containerCwd: state.containerCwd,
-      sudoCwd: state.sudoCwd,
-    };
-    // Temporarily set the name so the capability cache and probe use this target;
-    // publish the complete state only after the directory has been confirmed.
-    state.container = name;
-    const saved = loadRemoteConfig().endpoints?.[cacheId(state)]?.containerCwds?.[name];
-    state.containerCwd = saved;
-    try {
-      const caps = await probeDockerCaps(state);
-      const start = saved || "/";
-      const probe = saved
-        ? (caps.workdir
-          ? `docker exec -w ${quote(start)} ${quote(name)} ${caps.shell} -c 'pwd -P'`
-          : `docker exec ${quote(name)} ${caps.shell} -c 'cd -- ${quote(start)} 2>/dev/null || cd -- /; pwd -P'`)
-        : `docker exec ${quote(name)} ${caps.shell} -c 'pwd -P'`;
-      let resolved = (await execDockerRemote(state, probe, true, 60))
-        .toString().trim().split("\n").filter(Boolean).pop();
-      // A removed/renamed saved cwd should not poison the next context switch.
-      if ((!resolved || !resolved.startsWith("/")) && saved) {
-        const fallback = `docker exec ${quote(name)} ${caps.shell} -c 'pwd -P'`;
-        resolved = (await execDockerRemote(state, fallback, false, 60))
-          .toString().trim().split("\n").filter(Boolean).pop();
-      }
-      if (!resolved || !resolved.startsWith("/")) throw new Error(`无法解析容器 ${name} 的工作目录`);
-      applyPassthroughState(state, "container", name, resolved);
-      saveEndpointConfig(state.command, { passthroughMode: "container", passthroughContainer: name });
-      status(ctx);
-      return passthroughContextLabel(state);
-    } catch (error) {
-      applyPassthroughState(state, previous.mode, previous.container, previous.containerCwd, previous.sudoCwd);
-      throw error;
-    }
-  };
-
-  /**
-   * Run one raw user command on the `$` target: live box, Esc cancellation, and
-   * a durable transcript record that never enters the model context.
-   */
-  const runPassthrough = async (command: string, ctx: any, force = false): Promise<void> => {
-    const target = resolvePassthrough();
-    if ("error" in target) {
-      ctx.ui.notify(`$ ${target.error}`, "error");
-      return;
-    }
-    const { key, state } = target;
-    if (!force) {
-      const hazard = interactiveHazard(command);
-      if (hazard) {
-        const where = state.passthroughMode === "container"
-          ? `你已在容器 ${state.container} 中，直接发命令即可（如 $nvidia-smi）；换容器用 $ctx docker <名>。`
-          : state.passthroughMode === "sudo"
-            ? "当前是 sudo root 上下文；请把交互操作改成单条非交互命令。"
-            : `要在容器里执行，用 $ctx docker <名> 切换上下文；或压成一条：$docker exec -w <目录> <容器> <命令>。`;
-        ctx.ui.notify(
-          `$ ${hazard}。$ 通道只回传输出、不转发键盘，这条命令会一直挂到超时。
-${where}
-确需硬跑用 $force <命令>（之后按 Esc 退出）。`,
-          "warning",
-        );
-        return;
-      }
-    }
-    const label = endpointDisplayLabel(state);
-    const contextPath = passthroughContextLabel(state);
-    const timeoutSeconds = configuredRemoteTimeout(key);
-    const startedAt = Date.now();
-    const interactive = ctx.mode === "tui";
-    const abort = new AbortController();
-    let cancelled = false;
-    let component: PassthroughRunComponent | undefined;
-    const buffered: Buffer[] = [];
-
-    let remoteCommand: string;
-    let stdin: string | undefined;
-    try {
-      if (state.passthroughMode === "sudo") {
-        const password = await ensureSudoAccess(state, ctx);
-        if (password !== undefined) stdin = `${password}\n`;
-      }
-      remoteCommand = await buildPassthroughCommand(state, command);
-      // `probeDockerCaps` may have discovered that this SSH user cannot access
-      // docker.sock. Run the actual exec through the same SSH password-backed sudo.
-      if (state.passthroughMode === "container" && state.dockerSudo) {
-        const password = await requireSshPassword(state);
-        remoteCommand = sudoShellCommand(remoteCommand);
-        stdin = `${password}\n`;
-      }
-    } catch (error) {
-      ctx.ui.notify(`$ 准备执行环境失败: ${(error as Error).message}`, "error");
-      return;
-    }
-
-    const job = withReconnectFor(key, (client) => execRemoteDetailed(
-      client,
-      remoteCommand,
-      timeoutSeconds,
-      {
-        pty: interactive,
-        signal: interactive ? abort.signal : undefined,
-        stdin,
-        onData: (chunk) => {
-          // Display must never be able to kill the remote stream.
-          try { if (component) component.append(chunk); else buffered.push(chunk); }
-          catch { /* ignore render errors */ }
-        },
-      },
-    )).then(
-      (result: ExecRemoteResult) => ({ result: result as ExecRemoteResult | undefined, failure: undefined as string | undefined }),
-      (error: unknown) => ({ result: undefined as ExecRemoteResult | undefined, failure: (error as Error).message }),
-    );
-
-    if (!interactive) {
-      // Headless/RPC hosts get no box: run quietly and report the tail once.
-      const settled = await job;
-      const text = settled.result
-        ? formatRemoteOutput(settled.result.output.toString("utf8")).text
-        : `Error: ${settled.failure}`;
-      ctx.ui.notify(`$ ${command} -> ${key}\n${text}`, settled.result?.exitCode === 0 ? "info" : "warning");
-      recordPassthrough(command, key, label, contextPath, settled, Date.now() - startedAt);
-      return;
-    }
-
-    let closeBox: (() => void) | undefined;
-    const box = ctx.ui.custom((
-      tui: any,
-      theme: any,
-      _keys: any,
-      done: (result: { cancelled: boolean }) => void,
-    ) => {
-      closeBox = () => done({ cancelled });
-      component = new PassthroughRunComponent(
-        `${command}   [${label}:${contextPath}]`,
-        theme,
-        () => { cancelled = true; abort.abort(); },
-        () => tui.requestRender(),
-      );
-      for (const chunk of buffered.splice(0)) component.append(chunk);
-      return component;
-    });
-
-    // The box is constructed before `job` can settle, so no completion is missed.
-    const settled = await job;
-    const elapsedMs = Date.now() - startedAt;
-    const userCancelled = cancelled || Boolean(settled.result?.aborted);
-    component?.settle(settled.result, settled.failure, userCancelled, elapsedMs);
-    closeBox?.();
-    await box;
-    recordPassthrough(command, key, label, contextPath, settled, elapsedMs, userCancelled);
-  };
-
-  /** Persist one `$` run as a transcript entry that is not sent to the LLM. */
-  const recordPassthrough = (
-    command: string,
-    endpoint: string,
-    label: string,
-    cwd: string,
-    settled: { result?: ExecRemoteResult; failure?: string },
-    elapsedMs: number,
-    userCancelled = false,
-  ): void => {
-    const seconds = (elapsedMs / 1000).toFixed(1);
-    const aborted = userCancelled || Boolean(settled.result?.aborted);
-    const status: Exclude<PassthroughStatus, "running"> = aborted
-      ? "cancelled"
-      : settled.result?.timedOut ? "timeout"
-      : settled.failure || settled.result?.exitCode !== 0 ? "error"
-      : "complete";
-    const formatted = settled.result
-      ? formatRemoteOutput(settled.result.output.toString("utf8"))
-      : undefined;
-    const exitLine = status === "cancelled" ? `cancelled after ${seconds}s`
-      : status === "timeout" ? `timed out after ${seconds}s`
-      : settled.failure ? `failed: ${settled.failure}`
-      : `${status === "complete" ? "done" : "exit"} ${settled.result?.exitCode ?? "?"} in ${seconds}s`;
-    pi.appendEntry("ssh-passthrough", {
-      command,
-      endpoint,
-      label,
-      cwd,
-      status,
-      exitCode: settled.result?.exitCode ?? null,
-      text: formatted ? formatted.text : `Error: ${settled.failure}`,
-      truncated: Boolean(formatted?.truncation.truncated),
-      totalLines: formatted?.truncation.totalLines ?? 0,
-      fullOutputPath: formatted?.fullOutputPath,
-      elapsedMs,
-      exitLine,
-    } satisfies PassthroughRecord);
-  };
-
-  /** One-level picker: every connected endpoint with its live directory. */
-  const selectPassthroughTarget = async (ctx: any): Promise<void> => {
-    currentCtx = ctx;
-    const entries = [...connections.entries()];
-    if (!entries.length) {
-      ctx.ui.notify("没有已连接的 SSH 端点可设为 $ 穿透目标；先用 /remote ssh USER@HOST 或 ssh_remote_control connect 连接一台", "error");
-      return;
-    }
-    const resolved = resolvePassthrough();
-    const currentKey = "key" in resolved ? resolved.key : undefined;
-    const rows = entries.map(([key, state]) =>
-      `${key === currentKey ? "*" : " "} ${endpointDisplayLabel(state)}  ·  ${passthroughContextLabel(state)}`);
-    const choice = await withUiDialog<string | undefined>(() => ctx.ui.select("选择 $ 命令穿透的目标服务器（* 为当前目标）", rows));
-    if (choice === undefined) { ctx.ui.notify("未更改 $ 穿透目标", "info"); return; }
-    const picked = entries[rows.indexOf(choice)]?.[0];
-    if (!picked) return;
-    setPassthroughTarget(picked, ctx);
-    const state = connections.get(picked)!;
-    ctx.ui.notify(`$ 穿透目标 → ${endpointDisplayLabel(state)}:${passthroughContextLabel(state)}`, "info");
-  };
   const localRead = createReadTool(localCwd);
   const localWrite = createWriteTool(localCwd);
   const localEdit = createEditTool(localCwd);
@@ -3609,12 +2820,7 @@ ${where}
         const config = loadRemoteConfig();
         const rows = Object.entries(config.endpoints ?? {}).map(([key, endpoint]) => {
           const active = key === config.activeEndpoint ? "*" : " ";
-          const passthrough = endpoint.passthroughMode === "container" && endpoint.passthroughContainer
-            ? `docker ${endpoint.passthroughContainer} ${endpoint.containerCwds?.[endpoint.passthroughContainer] || "/"}`
-            : endpoint.passthroughMode === "sudo"
-              ? `sudo root ${endpoint.sudoCwd || endpoint.remoteCwd || FALLBACK_REMOTE_CWD}`
-              : "host";
-          return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    $ context: ${passthrough}\n    forward: ${endpoint.forwards?.join(", ") || "none"}\n    password: ${persistentCredentials.backendFor(key) ? `saved with ${persistentCredentials.backendFor(key)}` : "not saved"}`;
+          return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}\n    password: ${persistentCredentials.backendFor(key) ? `saved with ${persistentCredentials.backendFor(key)}` : "not saved"}`;
         });
         ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\nDisplay lines: ${configuredDisplayLines(config)}\n${rows.join("\n") || "No saved endpoints"}`, "info");
         return;
@@ -3771,7 +2977,7 @@ ${where}
         return;
       }
       if (["status", "connections"].includes(action)) {
-        const rows = [...connections.entries()].map(([key, state]) => `${remote && cacheId(remote) === key ? "*" : " "} ${key}  cwd=${state.cwd}  $=${passthroughContextLabel(state)}`);
+        const rows = [...connections.entries()].map(([key, state]) => `${remote && cacheId(remote) === key ? "*" : " "} ${key}  cwd=${state.cwd}`);
         ctx.ui.notify(`${connections.size} SSH connection(s); tools: ${remote && routeRemoteTools ? `remote via ${cacheId(remote)}` : "local"}\n${rows.join("\n") || "No live SSH connections"}`, "info");
         return;
       }
@@ -3845,168 +3051,18 @@ ${where}
     connectingLabels.clear();
     remote = null;
     routeRemoteTools = false;
-    sudoPasswords.clear();
     void stopForwards();
     for (const state of previous) state.client.end();
     if (event.reason !== "reload") credentialCache.resume = undefined;
   });
-  // Pi's `!`/`!!` bash mode is intentionally NOT intercepted anymore: user `!`
-  // commands always run locally. `$` passthrough is handled by the input event
-  // below and only hits the endpoint chosen via /control_ssh.
-
-  const passthroughHelp = (target: { key: string; state: RemoteState } | { error: string }): string => {
-    const head = "key" in target
-      ? `当前穿透目标: ${target.key} · ${passthroughContextLabel(target.state)}`
-      : `当前穿透目标: ${target.error}`;
-    return [
-      head,
-      "",
-      "$ <command>          在穿透目标上执行（结果不进模型上下文）",
-      "$cd <path>           切换当前上下文的目录（容器上下文则在容器内解析）",
-      "$ctx                 选择执行上下文：宿主机普通用户、sudo root 或 Docker 容器",
-      "$ctx host            回到宿主机普通用户上下文",
-      "$ctx sudo            切到宿主机 root 上下文（自动复用已保存的 SSH 密码）",
-      "$ctx docker <名>     进入指定容器执行后续命令",
-      "$ctx list            列出宿主机目录与可用容器",
-      "$server [selector]   选择/查看 $ 穿透的目标服务器（同 /control_ssh）",
-      "$force <command>     跳过交互命令预检硬跑（之后按 Esc 退出）",
-      "",
-      "提示：内置工具与文件传输始终在宿主机；$ 后紧跟数字（如 $100）视为普通消息。",
-    ].join("\n");
-  };
-
-  pi.on("input", async (event, ctx) => {
-    if (event.source !== "interactive" || event.images?.length) return { action: "continue" };
-    const trimmed = event.text.trimStart();
-    if (!trimmed.startsWith("$")) return { action: "continue" };
-    const body = trimmed.slice(1).trim();
-    // "$100 是多少" is chat, not a command; shell commands never start with a digit.
-    if (/^[0-9]/.test(body)) return { action: "continue" };
-    currentCtx = ctx;
-    const target = resolvePassthrough();
-
-    if (!body) {
-      ctx.ui.notify(passthroughHelp(target), "info");
-      return { action: "handled" };
-    }
-
-    if (body === "cd" || body.startsWith("cd ")) {
-      if ("error" in target) { ctx.ui.notify(`$cd ${target.error}`, "error"); return { action: "handled" }; }
-      const inContainer = target.state.passthroughMode === "container";
-      const inSudo = target.state.passthroughMode === "sudo";
-      const requested = body.slice(2).trim() || FALLBACK_REMOTE_CWD;
-      try {
-        const resolved = inContainer
-          ? await changeContainerCwd(target.state, requested, ctx)
-          : inSudo
-            ? await changeSudoCwd(target.state, requested, ctx)
-            : await changeRemoteCwd(requested, ctx, target.state);
-        ctx.ui.notify(`$ 上下文目录 (${target.key}): ${resolved}`, "info");
-      } catch (error) {
-        ctx.ui.notify(`$cd 失败: ${(error as Error).message}`, "error");
-      }
-      return { action: "handled" };
-    }
-
-    if (body === "ctx" || body.startsWith("ctx ")) {
-      if ("error" in target) { ctx.ui.notify(`$ctx ${target.error}`, "error"); return { action: "handled" }; }
-      try {
-        await switchPassthroughContext(target.state, body.slice(3), ctx);
-      } catch (error) {
-        ctx.ui.notify(`$ctx 失败: ${(error as Error).message}`, "error");
-      }
-      return { action: "handled" };
-    }
-
-    if (body === "server" || body.startsWith("server ")) {
-      const requested = body.slice(6).trim();
-      if (!requested) { await selectPassthroughTarget(ctx); return { action: "handled" }; }
-      try {
-        const key = resolveEndpointKey(requested, true);
-        setPassthroughTarget(key, ctx);
-        const picked = connections.get(key)!;
-        ctx.ui.notify(`$ 穿透目标 → ${endpointDisplayLabel(picked)}:${passthroughContextLabel(picked)}`, "info");
-      } catch (error) {
-        ctx.ui.notify(`$server 失败: ${(error as Error).message}`, "error");
-      }
-      return { action: "handled" };
-    }
-
-    if (body === "force" || body.startsWith("force ")) {
-      const forced = body.slice(5).trim();
-      if (!forced) { ctx.ui.notify("$force 需要跟一条命令，例如 $force docker exec -it foo bash", "error"); return { action: "handled" }; }
-      if ("error" in target) { ctx.ui.notify(`$ ${target.error}`, "error"); return { action: "handled" }; }
-      await runPassthrough(forced, ctx, true);
-      return { action: "handled" };
-    }
-
-    if ("error" in target) { ctx.ui.notify(`$ ${target.error}`, "error"); return { action: "handled" }; }
-    await runPassthrough(body, ctx);
-    return { action: "handled" };
-  });
-
-  // Collapsed/expandable transcript record for `$` runs (never sent to the LLM).
-  pi.registerEntryRenderer("ssh-passthrough", (entry, { expanded }, theme) => {
-    const data = entry.data as PassthroughRecord | undefined;
-    if (!data) return undefined;
-    const lines = data.text.split("\n");
-    const shown = expanded || lines.length <= PASSTHROUGH_PREVIEW_LINES ? lines : lines.slice(-PASSTHROUGH_PREVIEW_LINES);
-    const omitted = lines.length - shown.length;
-    const meta = [
-      theme.fg(data.status === "complete" ? "success" : "warning", data.exitLine),
-      data.fullOutputPath ? theme.fg("muted", `完整输出: ${data.fullOutputPath}`) : undefined,
-      !expanded && (omitted > 0 || data.truncated) ? theme.fg("muted", safeKeyHint("app.tools.expand", "展开", "Ctrl+O 展开")) : undefined,
-    ].filter(Boolean).join("  ·  ");
-    const head = `${theme.fg("bashMode", theme.bold(`$ ${data.command}`))}${theme.fg("muted", `  →  ${data.label}:${data.cwd}`)}`;
-    return new Text([
-      head,
-      ...(omitted > 0 ? [theme.fg("muted", `… 省略 ${omitted} 行`)] : []),
-      ...shown.map((line) => theme.fg("toolOutput", line)),
-      meta,
-    ].join("\n"), 1, 0);
-  });
-
-  pi.registerCommand("control_ssh", {
-    description: "选择 $ 命令穿透到哪台已连接服务器（单级菜单，列出所有在线端点及其当前目录）",
-    getArgumentCompletions: (prefix) => {
-      const wanted = (prefix ?? "").toLowerCase();
-      const items = [...connections.entries()].map(([key, state]) => ({
-        value: key,
-        label: key,
-        description: passthroughContextLabel(state),
-      })).filter((item) => !wanted || item.value.toLowerCase().includes(wanted));
-      return items.length ? items.slice(0, 20) : null;
-    },
-    handler: async (args, ctx) => {
-      currentCtx = ctx;
-      const requested = args.trim();
-      if (requested) {
-        try {
-          const key = resolveEndpointKey(requested, true);
-          setPassthroughTarget(key, ctx);
-          const state = connections.get(key)!;
-          ctx.ui.notify(`$ 穿透目标 → ${endpointDisplayLabel(state)}:${passthroughContextLabel(state)}`, "info");
-        } catch (error) {
-          ctx.ui.notify((error as Error).message, "error");
-        }
-        return;
-      }
-      await selectPassthroughTarget(ctx);
-    },
-  });
-
   pi.on("before_agent_start", (event) => {
     if (!connections.size) return undefined;
     const endpoints = [...connections.entries()].map(([key, state]) => `${key} (${state.cwd})`).join(", ");
-    const passthrough = resolvePassthrough();
-    const passthroughNote = "key" in passthrough
-      ? `The user's \`$\` passthrough commands go to ${passthrough.key} in context "${passthroughContextLabel(passthrough.state)}" and run outside this conversation; their output is NOT in your context (use ssh_remote_exec yourself if you need the same result, or ask the user to share it). \`$\` may be pointed at a container, while built-in tools and file transfers always stay on the host.`
-      : `The user has no \`$\` passthrough target selected yet (${passthrough.error}).`;
     const routing = remote && routeRemoteTools
       ? `Current working directory: ${remote.cwd} (via active SSH ${endpointDisplayLabel(remote)}). Built-in read, write, edit, and bash tools run on this active server; the user's \`!\`/\`!!\` commands always run locally on ${localCwd}.`
       : `Current working directory: ${localCwd}. Built-in tools and the user's \`!\` commands run locally.`;
-    const systemPrompt = event.systemPrompt.replace(`Current working directory: ${localCwd}`, `${routing} ${passthroughNote}`)
-      + `\n\nLive SSH endpoints: ${endpoints}. Use ssh_remote_read, ssh_remote_write, ssh_remote_edit, ssh_remote_exec, or ssh_remote_batch with an explicit endpoint to operate on any connected server without switching the active workspace. Use ssh_remote_control action activate to switch transparent built-in tool routing, /control_ssh (or \`$server\`) to change which server the user's \`$\` commands hit, and \`$ctx\` to change the \`$\` execution context between the host user, sudo root, and a running Docker container. Transfer files with ssh_remote_put (local→server), ssh_remote_get (server→local), or ssh_remote_transfer (server→server; relayed through this machine). Each accepts a single endpoint or a targets list for fan-out, handles directories recursively, and streams progress. When a remote step needs a password (remote sudo -S, another service, a jump host) and no prompt is available, decode the saved one for an endpoint with ssh_remote_password — treat the output as sensitive.`;
+    const systemPrompt = event.systemPrompt.replace(`Current working directory: ${localCwd}`, routing)
+      + `\n\nLive SSH endpoints: ${endpoints}. Use ssh_remote_read, ssh_remote_write, ssh_remote_edit, ssh_remote_exec, or ssh_remote_batch with an explicit endpoint to operate on any connected server without switching the active workspace. Use ssh_remote_control action activate to switch transparent built-in tool routing. Transfer files with ssh_remote_put (local→server), ssh_remote_get (server→local), or ssh_remote_transfer (server→server; relayed through this machine). Each accepts a single endpoint or a targets list for fan-out, handles directories recursively, and streams progress. When a remote step needs a password (remote sudo -S, another service, a jump host) and no prompt is available, decode the saved one for an endpoint with ssh_remote_password — treat the output as sensitive.`;
     return { systemPrompt };
   });
 }

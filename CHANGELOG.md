@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.0
+
+- **移除面向用户的命令穿透通道**：插件现在只提供 Agent 操作服务器的能力
+  （`ssh_remote_*` 工具、`/remote` 控制面、内置工具透明路由、文件传输、凭据管理）。
+- 删除 `$` 输入拦截及其全部子命令：`$ <cmd>`、`$cd`、`$ctx`、`$server`、`$force`、
+  `ssh-passthrough` 会话条目渲染器、底部 `$→` 状态栏。
+- 删除容器执行上下文：容器发现、`$ctx docker <name>`、`docker exec` 包装、`containerCwds`。
+- 删除 sudo 执行上下文：`$ctx sudo`、sudo 目录缓存、sudo 密码复用，以及 docker.sock
+  权限不足时自动 `sudo docker` 的重试。
+- 删除仅为穿透服务的交互命令预检（`interactiveHazard`）、`/control_ssh` 命令与
+  `passthroughEndpoint` 持久化字段；配置里遗留的这些键会在下次保存时被清除。
+- 删除对应的离线测试 `test/passthrough-input.ts`、`test/passthrough-hazard.ts`，
+  README / README.zh-CN / skill 同步移除相关章节。
+- 保留不变：多端点连接池、自动重连、`/remote` 命令、`ssh_remote_*` 全量工具、
+  内置工具远程路由、端口转发、跨平台凭据后端、UI 对话框串行化。
+
 ## 0.6.1
 
 - 修复并行首次连接时后续服务器卡死：pi 的交互层同一时刻只能显示一个扩展对话框，
