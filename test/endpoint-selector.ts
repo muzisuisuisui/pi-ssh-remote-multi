@@ -44,14 +44,15 @@ check("unknown address stays unresolved", () => assert.deepEqual(resolve("10.9.9
 check("normalize strips ssh decoration", () => {
   assert.equal(normalizeEndpointSelector("  ssh  root@10.0.0.1 -p 2202  "), "root@10.0.0.1");
 });
-check("failure lists every endpoint and marks connectivity", () => {
+check("failure lists every endpoint, marks connectivity, hides notes", () => {
   const message = describeEndpointResolutionFailure(
     "10.9.9.9", KEYS, ENDPOINTS, new Set(["z00525195@110.3.241.21:22"]), false,
   );
   assert.match(message, /Endpoint not found: "10\.9\.9\.9"/);
   for (const key of KEYS) assert.ok(message.includes(key), `missing ${key}`);
-  assert.match(message, /z00525195@110\.3\.241\.21:22 {2}\(connected; \.21/);
-  assert.match(message, /l00567503@110\.3\.241\.16:22 {2}\(configured; \.16/);
+  assert.match(message, /z00525195@110\.3\.241\.21:22 {2}\(connected\)/);
+  assert.match(message, /l00567503@110\.3\.241\.16:22 {2}\(configured\)/);
+  assert.doesNotMatch(message, /dsv41|master|work15/);
   assert.match(message, /ssh_remote_control action=connect/);
 });
 check("ambiguous failure names the candidates", () => {

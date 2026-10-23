@@ -1,6 +1,6 @@
 {
   "name": "pi-ssh-remote-multi",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Persistent multi-server SSH workspaces for Pi.",
   "type": "module",
   "author": "Yutong Bian and contributors",

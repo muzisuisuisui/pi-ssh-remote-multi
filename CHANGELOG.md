@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.2
+
+- 端点备注（note）不再出现在任何显示面：footer 标签、`ssh_remote_control` 的
+  `status`/`connections`/`endpoints` 输出、`/remote config`、`/remote status`、
+  系统提示中的端点清单、端点解析失败时的端点列表，以及 `action=note` 的成功提示。
+- 备注仍保存在 `ssh-remote-config.json` 中，仍可作为端点选择器的匹配依据
+  （例如 `master`、`work15`、`.21`），只是不会被渲染出来。
+- 端点显示统一为 `user@host:port`，便于复制为工具参数。
+
 ## 0.7.1
 
 - 修复 agent 调用工具时因端点写法不标准而报 `Endpoint not found` 的问题。

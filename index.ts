@@ -647,8 +647,7 @@ export function describeEndpointResolutionFailure(
   matches: string[] = [],
 ): string {
   const shown = keys.slice(0, 25).map((key) => {
-    const note = endpoints[key]?.note?.trim();
-    const flags = [connected.has(key) ? "connected" : "configured", note].filter(Boolean).join("; ");
+    const flags = [connected.has(key) ? "connected" : "configured"].filter(Boolean).join("; ");
     return `  - ${key}${flags ? `  (${flags})` : ""}`;
   });
   const more = keys.length > shown.length ? `\n  ...and ${keys.length - shown.length} more` : "";
@@ -824,9 +823,9 @@ function activeSshCommand(config = loadRemoteConfig()): string | undefined {
   return activeEndpointConfig(config)?.sshCommand;
 }
 
-function endpointDisplayLabel(endpoint: ParsedSsh, config = loadRemoteConfig()): string {
-  const note = endpointConfig(config, endpoint.command).note?.trim();
-  return note ? `${note} (${endpoint.label})` : endpoint.label;
+function endpointDisplayLabel(endpoint: ParsedSsh): string {
+  // Notes stay in the config for selector matching, but are never rendered.
+  return endpoint.label;
 }
 
 function saveEndpointConfig(command: string, updates: RemoteEndpointConfig, makeActive = false): void {
@@ -1661,7 +1660,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     return [...connections.entries()].map(([endpoint, state]) => ({
       endpoint,
       cwd: state.cwd,
-      note: config.endpoints?.[endpoint]?.note,
       selected: Boolean(remote && cacheId(remote) === endpoint),
       passwordSaved: persistentCredentials.has(endpoint),
     }));
@@ -2784,7 +2782,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
       if (params.action === "status" || params.action === "connections") {
         const mappings = [...forwardServers.keys()].sort((a, b) => a - b);
         const pool = connectionSnapshot();
-        const rows = pool.map((entry) => `${entry.selected ? "*" : " "} ${entry.endpoint}  cwd=${entry.cwd}${entry.note ? `  note=${entry.note}` : ""}${entry.passwordSaved ? "  password=saved" : ""}`);
+        const rows = pool.map((entry) => `${entry.selected ? "*" : " "} ${entry.endpoint}  cwd=${entry.cwd}${entry.passwordSaved ? "  password=saved" : ""}`);
         const text = `${connections.size} SSH connection(s); tool routing: ${remote && routeRemoteTools ? `remote via ${cacheId(remote)}` : "local"}${mappings.length ? `; forwarded local ports: ${mappings.join(", ")}` : ""}\n${rows.join("\n") || "No live SSH connections"}`;
         return { content: [{ type: "text", text }], details: { connected: connections.size > 0, connectionCount: connections.size, connections: pool, selectedEndpoint: remote ? cacheId(remote) : undefined, cwd: remote?.cwd, toolRouting: remote && routeRemoteTools ? "remote" : "local", configPath: REMOTE_CONFIG_FILE, credentialsPath: CREDENTIALS_FILE, credentialBackend: persistentCredentials.label, credentialBackends: persistentCredentials.backends, forwardedPorts: mappings } };
       }
@@ -2798,7 +2796,6 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
             live ? "connected" : "configured",
             live ? `cwd=${live.cwd}` : saved?.remoteCwd ? `cwd=${saved.remoteCwd}` : undefined,
             key === config.activeEndpoint ? "active" : undefined,
-            saved?.note?.trim(),
             persistentCredentials.has(key) ? "password=saved" : undefined,
           ].filter(Boolean).join("; ");
           return `- ${key}  (${flags})`;
@@ -2899,8 +2896,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         if (remote && cacheId(remote) === cacheId(parseSshCommand(command)) && currentCtx) status(currentCtx);
         const label = parseSshCommand(command).label;
         return {
-          content: [{ type: "text", text: note ? `SSH remote note updated (${label}): ${note}` : `SSH remote note cleared (${label})` }],
-          details: { endpoint: label, note },
+          content: [{ type: "text", text: note ? `SSH remote note updated (${label}).` : `SSH remote note cleared (${label}).` }],
+          details: { endpoint: label },
         };
       }
       if (params.action === "exec") {
@@ -2953,7 +2950,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const config = loadRemoteConfig();
         const rows = Object.entries(config.endpoints ?? {}).map(([key, endpoint]) => {
           const active = key === config.activeEndpoint ? "*" : " ";
-          return `${active} ${key}\n    note: ${endpoint.note || "none"}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}\n    password: ${persistentCredentials.backendFor(key) ? `saved with ${persistentCredentials.backendFor(key)}` : "not saved"}`;
+          return `${active} ${key}\n    SSH: ${endpoint.sshCommand}\n    cwd: ${endpoint.remoteCwd || FALLBACK_REMOTE_CWD}\n    forward: ${endpoint.forwards?.join(", ") || "none"}\n    password: ${persistentCredentials.backendFor(key) ? `saved with ${persistentCredentials.backendFor(key)}` : "not saved"}`;
         });
         ctx.ui.notify(`SSH remote configuration: ${REMOTE_CONFIG_FILE}\nDisplay lines: ${configuredDisplayLines(config)}\n${rows.join("\n") || "No saved endpoints"}`, "info");
         return;
@@ -2994,7 +2991,7 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const note = value.toLowerCase() === "--clear" ? undefined : value;
         saveEndpointConfig(command, { note });
         if (remote && cacheId(remote) === cacheId(parseSshCommand(command))) status(ctx);
-        ctx.ui.notify(note ? `SSH remote note updated (${parseSshCommand(command).label}): ${note}` : `SSH remote note cleared (${parseSshCommand(command).label})`, "info");
+        ctx.ui.notify(note ? `SSH remote note updated (${parseSshCommand(command).label})` : `SSH remote note cleared (${parseSshCommand(command).label})`, "info");
         return;
       }
       if (/^config\s+display-lines\s+/i.test(input)) {
@@ -3195,9 +3192,8 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     // Give the model ground truth for *every* configured endpoint, not only the
     // live ones: most wrong-endpoint failures come from retyping an address.
     const known = keys.slice(0, 20).map((key) => {
-      const note = config.endpoints?.[key]?.note?.trim();
       const cwd = connections.get(key)?.cwd ?? config.endpoints?.[key]?.remoteCwd;
-      const flags = [connections.has(key) ? "connected" : "configured", cwd, note].filter(Boolean).join("; ");
+      const flags = [connections.has(key) ? "connected" : "configured", cwd].filter(Boolean).join("; ");
       return `\n- ${key}${flags ? ` (${flags})` : ""}`;
     });
     const more = keys.length > known.length ? `\n- ...and ${keys.length - known.length} more` : "";

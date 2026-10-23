@@ -232,7 +232,7 @@ Pi 会通过插件提供的 `ssh_remote_control` 工具完成这些操作。
 | `/remote connections` | 查看当前保持的全部 SSH 连接 |
 | `/remote use USER@HOST:PORT` | 选择默认服务器，不断开其他连接、不自动改变路由 |
 | `/remote on` | 把内置 `read/write/edit/bash` 显式路由到当前选中的服务器 |
-| `/remote config note TEXT` | 给当前服务器添加或修改备注 |
+| `/remote config note TEXT` | 给当前服务器添加或修改备注（仅用于选择器匹配，不再显示） |
 | `/remote config note --clear` | 清除当前服务器备注 |
 | `/remote config cwd PATH` | 设置默认远程工作目录 |
 | `/remote cd PATH` | 切换当前远程目录并保存 |
@@ -278,7 +278,7 @@ Pi 会通过插件提供的 `ssh_remote_control` 工具完成这些操作。
 
 解析按"精确 key → 地址（忽略用户名）→ 备注 → IP 末位 → 前缀 → 子串"逐级进行。
 某一级命中多台服务器时不会替你猜，而是返回歧义错误并列出全部候选 key，
-错误信息里始终带有当前所有已配置端点（标注 connected / configured / note），
+错误信息里始终带有当前所有已配置端点（标注 connected / configured），
 便于下一轮直接用正确 key 重试。需要重新确认清单时可调用
 `ssh_remote_control action=endpoints`。
 
