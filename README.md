@@ -32,6 +32,11 @@
 | `ssh_remote_control` | 连接/激活/路由/重连/转发/断开等控制面 |
 | `ssh_remote_password` | 解码已保存端点的明文密码（仅必要时调用，注意敏感） |
 
+端点选择器很宽松：完整 key、裸 IP、`host:port`、`user@host`、备注片段、IP 末位（`21`/`.21`）、
+甚至 `ssh root@IP -p 22` 都能命中；用户名写错但地址唯一时也会解析到该端点。
+命中多台时不会猜，而是报歧义并列出候选；任何失败信息都附带全部已配置端点（标注 connected/configured/note），
+也可用 `ssh_remote_control action=endpoints` 重新取清单。
+
 ## 用户命令
 
 ```

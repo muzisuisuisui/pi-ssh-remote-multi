@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.7.1
+
+- 修复 agent 调用工具时因端点写法不标准而报 `Endpoint not found` 的问题。
+  端点选择器现在分层解析：完整 key → 地址（忽略用户名，如 `root@IP`）→ 备注片段
+  （`work15`）→ IP 末位（`21`/`.21`）→ 前缀 → 子串；`ssh root@IP -p 22` 与带引号的 key 也能解析。
+- 命中多台服务器时仍然拒绝猜测：返回歧义错误并列出候选，
+  不再静默落到某台机器上执行。
+- 所有端点解析失败的错误信息改为可自我纠正：列出当前全部已配置端点，
+  标注 connected/configured、cwd、note，并提示用 `ssh_remote_control action=connect` 连接缺失端点。
+- 系统提示中的端点清单从“仅在线端点”改为“全部已配置端点（标注 connected）”，
+  并要求优先复制完整 key，避免模型凭记忆重写 IP。
+- `ssh_remote_control` 新增 `action=endpoints`：列出全部已配置端点（无论是否已连接）。
+- 新增离线回归测试 `test/endpoint-selector.ts`，覆盖完整 key、裸 IP、`host:port`、
+  `user@host`、用户名不符、备注、IP 末位、引号/ssh 前缀、歧义与未命中、错误文案。
+
 ## 0.7.0
 
 - **移除面向用户的命令穿透通道**：插件现在只提供 Agent 操作服务器的能力

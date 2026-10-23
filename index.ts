@@ -535,15 +535,57 @@ function cacheId(config: ParsedSsh): string {
   return `${config.username}@${config.host}:${config.port}`;
 }
 
+/**
+ * Canonical endpoint key shape: `user@host:port`.
+ * Selectors are deliberately forgiving because the model (and the user) often
+ * retypes an address instead of copying the exact key from the endpoint list.
+ */
+const ENDPOINT_KEY_RE = /^([^@\s]+)@([^:\s]+):(\d+)$/;
+
+/** Trim decoration models tend to add: quotes, backticks, an `ssh ` prefix, ssh flags. */
+export function normalizeEndpointSelector(requested: string): string {
+  let value = requested.trim().replace(/^[\s"'`]+|[\s"'`]+$/g, "");
+  if (/^ssh\s+/i.test(value)) value = value.replace(/^ssh\s+/i, "").trim();
+  const words = value.split(/\s+/);
+  if (words.length > 1) {
+    const positional: string[] = [];
+    for (let index = 0; index < words.length; index += 1) {
+      const word = words[index]!;
+      if (word === "-p" || word === "-l") { index += 1; continue; }
+      if (word.startsWith("-")) continue;
+      positional.push(word);
+    }
+    if (positional.length === 1) value = positional[0]!;
+  }
+  return value.trim().toLowerCase();
+}
+
+/** Split a selector into host/port, ignoring a username that may be wrong. */
+function selectorAddress(requested: string): { host: string; port?: string } | undefined {
+  const at = requested.lastIndexOf("@");
+  let rest = at >= 0 ? requested.slice(at + 1) : requested;
+  if (!rest) return undefined;
+  let port: string | undefined;
+  const colon = rest.match(/^(.*):(\d+)$/);
+  if (colon) { rest = colon[1]!; port = colon[2]!; }
+  if (!rest || /[\s/]/.test(rest)) return undefined;
+  return { host: rest, ...(port ? { port } : {}) };
+}
+
+/**
+ * Resolve a selector against configured endpoint keys, best tier first.
+ * Every tier returns *all* matches, so the caller reports ambiguity instead of
+ * silently picking a server.
+ */
 export function endpointSelectorMatches(
   keys: string[],
   endpoints: Record<string, { note?: string } | undefined>,
   requested: string,
 ): string[] {
-  const needle = requested.trim().toLowerCase();
+  const needle = normalizeEndpointSelector(requested);
   if (!needle) return [];
   const aliases = (key: string): string[] => {
-    const match = key.match(/^([^@]+)@(.+):(\d+)$/);
+    const match = key.match(ENDPOINT_KEY_RE);
     const endpoint = endpoints[key];
     const values = [key];
     if (match) {
@@ -553,10 +595,73 @@ export function endpointSelectorMatches(
     if (endpoint?.note?.trim()) values.push(endpoint.note.trim());
     return values.map((value) => value.toLowerCase());
   };
+  const unique = (matches: string[]): string[] => (matches.length ? [...new Set(matches)] : []);
 
-  const exact = keys.filter((key) => aliases(key).some((alias) => alias === needle));
+  // 1. Exact key, host, host:port, user@host or note.
+  const exact = unique(keys.filter((key) => aliases(key).some((alias) => alias === needle)));
   if (exact.length) return exact;
-  return keys.filter((key) => aliases(key).some((alias) => alias.startsWith(needle)));
+
+  // 2. Same address with a different or absent username: `root@IP` is what the
+  //    model invents when it retypes a server instead of copying the key.
+  const address = selectorAddress(needle);
+  if (address && (address.host.includes(".") || /[a-z]/i.test(address.host))) {
+    const byAddress = unique(keys.filter((key) => {
+      const match = key.match(ENDPOINT_KEY_RE);
+      if (!match) return false;
+      const [, , host, port] = match;
+      if (host!.toLowerCase() !== address.host) return false;
+      return !address.port || address.port === port;
+    }));
+    if (byAddress.length) return byAddress;
+  }
+
+  // 3. Note substring ("work15", "master", "A5 box") when it is unambiguous.
+  const byNote = unique(keys.filter((key) => endpoints[key]?.note?.toLowerCase().includes(needle)));
+  if (byNote.length) return byNote;
+
+  // 4. Trailing octet ("21", ".21") as in "the server ending in .21".
+  const octet = needle.replace(/^\./, "");
+  if (/^\d{1,3}$/.test(octet)) {
+    const byOctet = unique(keys.filter((key) => {
+      const match = key.match(ENDPOINT_KEY_RE);
+      return match ? match[2]!.toLowerCase().endsWith(`.${octet}`) : false;
+    }));
+    if (byOctet.length) return byOctet;
+  }
+
+  // 5. Legacy prefix match on any alias.
+  const prefix = unique(keys.filter((key) => aliases(key).some((alias) => alias.startsWith(needle))));
+  if (prefix.length) return prefix;
+
+  // 6. Last resort: substring on key / host / user@host.
+  return unique(keys.filter((key) => aliases(key).slice(0, 4).some((alias) => alias.includes(needle))));
+}
+
+/** Actionable error text for the agent when a selector does not resolve. */
+export function describeEndpointResolutionFailure(
+  requested: string,
+  keys: string[],
+  endpoints: Record<string, { note?: string } | undefined>,
+  connected: Set<string>,
+  connectedOnly: boolean,
+  matches: string[] = [],
+): string {
+  const shown = keys.slice(0, 25).map((key) => {
+    const note = endpoints[key]?.note?.trim();
+    const flags = [connected.has(key) ? "connected" : "configured", note].filter(Boolean).join("; ");
+    return `  - ${key}${flags ? `  (${flags})` : ""}`;
+  });
+  const more = keys.length > shown.length ? `\n  ...and ${keys.length - shown.length} more` : "";
+  const list = keys.length
+    ? `Known endpoints:\n${shown.join("\n")}${more}`
+    : "No endpoints are configured yet; connect one with ssh_remote_control action=connect.";
+  if (matches.length > 1) {
+    return `Endpoint selector is ambiguous: "${requested}" matches ${matches.join(", ")}. Pass one of those keys exactly.\n${list}`;
+  }
+  if (connectedOnly) {
+    return `Endpoint not found or not connected: "${requested}". Reconnect it first (ssh_remote_control action=connect or action=reconnect), or pick a connected endpoint.\n${list}`;
+  }
+  return `Endpoint not found: "${requested}". Use an exact key from the list below, or an unambiguous part of it (host/IP, host:port, user@host, or note). Do not invent an IP; if the endpoint is missing, call ssh_remote_control action=connect first.\n${list}`;
 }
 
 async function getCachedPassword(config: ParsedSsh): Promise<string | undefined> {
@@ -1518,9 +1623,16 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     }
     const matches = endpointSelectorMatches(keys, config.endpoints ?? {}, requested);
     if (matches.length !== 1) {
-      throw new Error(matches.length
-        ? `Endpoint selector is ambiguous: ${matches.join(", ")}`
-        : `Endpoint not found${connectedOnly ? " or not connected" : ""}: ${requested}`);
+      // List every configured endpoint (not only connected ones) so the model can
+      // correct itself on the next call instead of guessing an address again.
+      throw new Error(describeEndpointResolutionFailure(
+        requested,
+        Object.keys(config.endpoints ?? {}),
+        config.endpoints ?? {},
+        new Set(connections.keys()),
+        connectedOnly,
+        matches,
+      ));
     }
     return matches[0]!;
   };
@@ -2648,13 +2760,14 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     promptSnippet: "Control the multi-server SSH pool, endpoint selection, passwords, and explicit local/remote routing",
     promptGuidelines: [
       "Use ssh_remote_control when the user asks the agent to connect, activate, reconnect, inspect, or disconnect SSH endpoints.",
+      "Use action endpoints to list every configured endpoint (connected or not) before choosing a selector; copy the exact key instead of retyping an address.",
       "Use ssh_remote_control with action chdir when the user asks to change the remote working directory; do not emulate a persistent directory change with action exec and a one-command cwd.",
       "Use action password to decode a saved endpoint's plaintext password (e.g. for remote sudo -S); treat the decoded value as sensitive and do not log it unless required.",
       `Always set timeout for ssh_remote_control remote exec commands; it defaults to ${DEFAULT_REMOTE_TIMEOUT_SECONDS} seconds when omitted.`,
       "Connecting or selecting an endpoint never enables remote routing by itself. Use action route with routing remote only when the user explicitly wants built-in tools redirected.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["connect", "activate", "route", "reconnect", "password", "status", "connections", "disconnect", "forget", "forward", "unforward", "exec", "chdir", "note", "local"] as const),
+      action: StringEnum(["connect", "activate", "route", "reconnect", "password", "status", "connections", "endpoints", "disconnect", "forget", "forward", "unforward", "exec", "chdir", "note", "local"] as const),
       command: Type.Optional(Type.String({ description: "SSH command for connect, such as ssh root@host -p 22; optionally selects the endpoint for note" })),
       endpoint: Type.Optional(Type.String({ description: ENDPOINT_SELECTOR_DESCRIPTION })),
       activate: Type.Optional(Type.Boolean({ description: "For connect: select this endpoint as the default target; defaults to false and never changes tool routing" })),
@@ -2674,6 +2787,26 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
         const rows = pool.map((entry) => `${entry.selected ? "*" : " "} ${entry.endpoint}  cwd=${entry.cwd}${entry.note ? `  note=${entry.note}` : ""}${entry.passwordSaved ? "  password=saved" : ""}`);
         const text = `${connections.size} SSH connection(s); tool routing: ${remote && routeRemoteTools ? `remote via ${cacheId(remote)}` : "local"}${mappings.length ? `; forwarded local ports: ${mappings.join(", ")}` : ""}\n${rows.join("\n") || "No live SSH connections"}`;
         return { content: [{ type: "text", text }], details: { connected: connections.size > 0, connectionCount: connections.size, connections: pool, selectedEndpoint: remote ? cacheId(remote) : undefined, cwd: remote?.cwd, toolRouting: remote && routeRemoteTools ? "remote" : "local", configPath: REMOTE_CONFIG_FILE, credentialsPath: CREDENTIALS_FILE, credentialBackend: persistentCredentials.label, credentialBackends: persistentCredentials.backends, forwardedPorts: mappings } };
+      }
+      if (params.action === "endpoints") {
+        const config = loadRemoteConfig();
+        const keys = Object.keys(config.endpoints ?? {});
+        const rows = keys.map((key) => {
+          const saved = config.endpoints?.[key];
+          const live = connections.get(key);
+          const flags = [
+            live ? "connected" : "configured",
+            live ? `cwd=${live.cwd}` : saved?.remoteCwd ? `cwd=${saved.remoteCwd}` : undefined,
+            key === config.activeEndpoint ? "active" : undefined,
+            saved?.note?.trim(),
+            persistentCredentials.has(key) ? "password=saved" : undefined,
+          ].filter(Boolean).join("; ");
+          return `- ${key}  (${flags})`;
+        });
+        const text = keys.length
+          ? `Configured endpoints (${keys.length}); pass one of these exact keys as the endpoint argument:\n${rows.join("\n")}`
+          : "No endpoints are configured yet; use action=connect with an ssh command first.";
+        return { content: [{ type: "text", text }], details: { endpointCount: keys.length, endpoints: keys, connected: connections.size > 0, connectionCount: connections.size, selectedEndpoint: remote ? cacheId(remote) : undefined, toolRouting: remote && routeRemoteTools ? "remote" : "local", configPath: REMOTE_CONFIG_FILE } };
       }
       if (params.action === "disconnect" || params.action === "forget") {
         const forget = params.action === "forget";
@@ -3056,13 +3189,23 @@ export default function sshRemoteExtension(pi: ExtensionAPI) {
     if (event.reason !== "reload") credentialCache.resume = undefined;
   });
   pi.on("before_agent_start", (event) => {
-    if (!connections.size) return undefined;
-    const endpoints = [...connections.entries()].map(([key, state]) => `${key} (${state.cwd})`).join(", ");
+    const config = loadRemoteConfig();
+    const keys = Object.keys(config.endpoints ?? {});
+    if (!keys.length) return undefined;
+    // Give the model ground truth for *every* configured endpoint, not only the
+    // live ones: most wrong-endpoint failures come from retyping an address.
+    const known = keys.slice(0, 20).map((key) => {
+      const note = config.endpoints?.[key]?.note?.trim();
+      const cwd = connections.get(key)?.cwd ?? config.endpoints?.[key]?.remoteCwd;
+      const flags = [connections.has(key) ? "connected" : "configured", cwd, note].filter(Boolean).join("; ");
+      return `\n- ${key}${flags ? ` (${flags})` : ""}`;
+    });
+    const more = keys.length > known.length ? `\n- ...and ${keys.length - known.length} more` : "";
     const routing = remote && routeRemoteTools
       ? `Current working directory: ${remote.cwd} (via active SSH ${endpointDisplayLabel(remote)}). Built-in read, write, edit, and bash tools run on this active server; the user's \`!\`/\`!!\` commands always run locally on ${localCwd}.`
       : `Current working directory: ${localCwd}. Built-in tools and the user's \`!\` commands run locally.`;
     const systemPrompt = event.systemPrompt.replace(`Current working directory: ${localCwd}`, routing)
-      + `\n\nLive SSH endpoints: ${endpoints}. Use ssh_remote_read, ssh_remote_write, ssh_remote_edit, ssh_remote_exec, or ssh_remote_batch with an explicit endpoint to operate on any connected server without switching the active workspace. Use ssh_remote_control action activate to switch transparent built-in tool routing. Transfer files with ssh_remote_put (local→server), ssh_remote_get (server→local), or ssh_remote_transfer (server→server; relayed through this machine). Each accepts a single endpoint or a targets list for fan-out, handles directories recursively, and streams progress. When a remote step needs a password (remote sudo -S, another service, a jump host) and no prompt is available, decode the saved one for an endpoint with ssh_remote_password — treat the output as sensitive.`;
+      + `\n\nSSH endpoints (exact keys; use one of these strings as the endpoint argument):${known.join("")}${more}\nCall ssh_remote_control action=endpoints if you need the current list again. Use ssh_remote_read, ssh_remote_write, ssh_remote_edit, ssh_remote_exec, or ssh_remote_batch with an explicit endpoint to operate on any configured server without switching the active workspace; a not-yet-connected endpoint is connected on demand. Prefer copying the exact key (including the username and port) instead of retyping an address. Use ssh_remote_control action activate to switch transparent built-in tool routing. Transfer files with ssh_remote_put (local→server), ssh_remote_get (server→local), or ssh_remote_transfer (server→server; relayed through this machine). Each accepts a single endpoint or a targets list for fan-out, handles directories recursively, and streams progress. When a remote step needs a password (remote sudo -S, another service, a jump host) and no prompt is available, decode the saved one for an endpoint with ssh_remote_password — treat the output as sensitive.`;
     return { systemPrompt };
   });
 }
